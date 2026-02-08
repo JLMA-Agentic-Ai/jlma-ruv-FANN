@@ -26,7 +26,7 @@ quote = "1.0"  # Rust code generation
 proc-macro2 = "1.0"
 
 # Async runtime
-tokio = { version = "1.35", features = ["rt", "sync", "time"], default-features = false }
+tokio = { version = "1.35", features = ["rt", "sync", "time", "macros"], default-features = false }
 futures = "0.3"
 
 # Serialization
@@ -86,6 +86,8 @@ getrandom = { version = "0.2", features = ["js"] }
 cuda-sys = { version = "0.2", optional = true }
 opencl3 = { version = "0.9", optional = true }
 vulkano = { version = "0.34", optional = true }
+# HTTP client for Nutanix Prism Central API
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false, optional = true }
 
 [dev-dependencies]
 # Benchmarking
@@ -128,6 +130,7 @@ parallel-compilation = []
 serde = ["dep:serde", "dep:serde_json", "dep:bincode"]
 gpu = []
 webgpu = []
+nutanix = ["reqwest", "dep:serde", "dep:serde_json"]
 
 # Testing features
 slow-tests = []
@@ -139,6 +142,23 @@ memory-safety = []
 [[example]]
 name = "vector_add"
 path = "examples/vector_add.rs"
+
+[[example]]
+name = "vector_add_neon"
+path = "examples/arm/vector_add_neon.rs"
+
+[[example]]
+name = "matrix_multiply_arm"
+path = "examples/arm/matrix_multiply_arm.rs"
+
+[[example]]
+name = "deploy_gpu_workload"
+path = "examples/nutanix/deploy_gpu_workload.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "benchmark_simd"
+path = "examples/simd/benchmark_simd.rs"
 
 [[bench]]
 name = "memory_benchmarks"

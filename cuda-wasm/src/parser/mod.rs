@@ -8,6 +8,7 @@ pub mod lexer;
 
 pub use cuda_parser::CudaParser;
 pub use ast::{Ast, KernelDef, Statement, Expression};
+pub use kernel_extractor::{extract_kernels, extract_kernel_by_name, KernelInfo};
 
 /// Parse CUDA source code and return AST
 pub fn parse(source: &str) -> crate::Result<Ast> {
