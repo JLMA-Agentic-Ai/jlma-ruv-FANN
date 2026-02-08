@@ -183,15 +183,15 @@ impl KernelTranslator {
     
     /// Detect kernel pattern from AST
     pub fn detect_pattern(&self, kernel: &KernelDef) -> KernelPattern {
-        // Analyze kernel body to detect pattern
-        if self.is_vector_pattern(kernel) {
-            KernelPattern::VectorAdd
-        } else if self.is_matrix_pattern(kernel) {
+        // Analyze kernel body to detect pattern (check more specific patterns first)
+        if self.is_matrix_pattern(kernel) {
             KernelPattern::MatrixMul
         } else if self.is_reduction_pattern(kernel) {
             KernelPattern::Reduction
         } else if self.is_stencil_pattern(kernel) {
             KernelPattern::Stencil
+        } else if self.is_vector_pattern(kernel) {
+            KernelPattern::VectorAdd
         } else {
             KernelPattern::Generic
         }
@@ -331,6 +331,12 @@ impl KernelTranslator {
         match stmt {
             Statement::Expr(expr) => self.expr_has_offset_access(expr),
             Statement::VarDecl { init: Some(expr), .. } => self.expr_has_offset_access(expr),
+            Statement::If { then_branch, else_branch, .. } => {
+                self.has_offset_access(then_branch) ||
+                else_branch.as_ref().map_or(false, |e| self.has_offset_access(e))
+            },
+            Statement::Block(block) => block.statements.iter().any(|s| self.has_offset_access(s)),
+            Statement::For { body, .. } | Statement::While { body, .. } => self.has_offset_access(body),
             _ => false,
         }
     }

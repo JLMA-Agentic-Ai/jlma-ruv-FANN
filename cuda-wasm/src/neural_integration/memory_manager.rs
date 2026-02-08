@@ -544,10 +544,16 @@ fn calculate_hash(data: &[f32]) -> u64 {
     
     let mut hasher = DefaultHasher::new();
     
-    // Hash a sample of the data for performance
-    let sample_size = (data.len() / 100).max(1).min(1000);
-    for i in (0..data.len()).step_by(data.len() / sample_size + 1) {
-        data[i].to_bits().hash(&mut hasher);
+    // Hash all elements for small data, sample for large
+    if data.len() <= 1000 {
+        for &val in data {
+            val.to_bits().hash(&mut hasher);
+        }
+    } else {
+        let step = data.len() / 1000;
+        for i in (0..data.len()).step_by(step.max(1)) {
+            data[i].to_bits().hash(&mut hasher);
+        }
     }
     data.len().hash(&mut hasher);
     

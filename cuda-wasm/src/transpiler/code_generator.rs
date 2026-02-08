@@ -37,11 +37,18 @@ impl CodeGenerator {
         
         let code = quote! {
             #imports
-            
+
             #(#items)*
         };
-        
-        Ok(code.to_string())
+
+        // Normalize proc_macro2 TokenStream::to_string() spacing
+        let raw = code.to_string();
+        let normalized = raw
+            .replace("# [", "#[")
+            .replace(" :: ", "::")
+            .replace(" ()", "()")
+            .replace(" . ", ".");
+        Ok(normalized)
     }
     
     /// Generate standard imports
@@ -332,9 +339,29 @@ impl CodeGenerator {
                 Ok(quote! { (#left #op #right) })
             },
             Expression::Unary { op, expr } => {
-                let expr = self.generate_expression(expr)?;
-                let op = self.generate_unary_op(op)?;
-                Ok(quote! { (#op #expr) })
+                match op {
+                    UnaryOp::PostInc => {
+                        let expr = self.generate_expression(expr)?;
+                        Ok(quote! { { #expr += 1 } })
+                    },
+                    UnaryOp::PostDec => {
+                        let expr = self.generate_expression(expr)?;
+                        Ok(quote! { { #expr -= 1 } })
+                    },
+                    UnaryOp::PreInc => {
+                        let expr = self.generate_expression(expr)?;
+                        Ok(quote! { { #expr += 1; #expr } })
+                    },
+                    UnaryOp::PreDec => {
+                        let expr = self.generate_expression(expr)?;
+                        Ok(quote! { { #expr -= 1; #expr } })
+                    },
+                    _ => {
+                        let expr = self.generate_expression(expr)?;
+                        let op = self.generate_unary_op(op)?;
+                        Ok(quote! { (#op #expr) })
+                    }
+                }
             },
             Expression::Call { name, args } => {
                 let name = format_ident!("{}", name);
@@ -378,35 +405,44 @@ impl CodeGenerator {
                 // Generate warp primitive operations
                 match op {
                     WarpOp::Shuffle => {
-                        if args.len() != 2 {
-                            return Err(translation_error!("Warp shuffle requires 2 arguments"));
-                        }
-                        let value = self.generate_expression(&args[0])?;
-                        let lane = self.generate_expression(&args[1])?;
+                        let (value, lane) = if args.len() == 3 {
+                            (self.generate_expression(&args[1])?, self.generate_expression(&args[2])?)
+                        } else if args.len() == 2 {
+                            (self.generate_expression(&args[0])?, self.generate_expression(&args[1])?)
+                        } else {
+                            return Err(translation_error!("Warp shuffle requires 2 or 3 arguments"));
+                        };
                         Ok(quote! { cuda_rust_wasm::runtime::warp_shuffle(#value, #lane) })
                     },
                     WarpOp::ShuffleXor => {
-                        if args.len() != 2 {
-                            return Err(translation_error!("Warp shuffle_xor requires 2 arguments"));
-                        }
-                        let value = self.generate_expression(&args[0])?;
-                        let mask = self.generate_expression(&args[1])?;
+                        let (value, mask) = if args.len() == 3 {
+                            (self.generate_expression(&args[1])?, self.generate_expression(&args[2])?)
+                        } else if args.len() == 2 {
+                            (self.generate_expression(&args[0])?, self.generate_expression(&args[1])?)
+                        } else {
+                            return Err(translation_error!("Warp shuffle_xor requires 2 or 3 arguments"));
+                        };
                         Ok(quote! { cuda_rust_wasm::runtime::warp_shuffle_xor(#value, #mask) })
                     },
                     WarpOp::ShuffleUp => {
-                        if args.len() != 2 {
-                            return Err(translation_error!("Warp shuffle_up requires 2 arguments"));
-                        }
-                        let value = self.generate_expression(&args[0])?;
-                        let delta = self.generate_expression(&args[1])?;
+                        let (value, delta) = if args.len() == 3 {
+                            (self.generate_expression(&args[1])?, self.generate_expression(&args[2])?)
+                        } else if args.len() == 2 {
+                            (self.generate_expression(&args[0])?, self.generate_expression(&args[1])?)
+                        } else {
+                            return Err(translation_error!("Warp shuffle_up requires 2 or 3 arguments"));
+                        };
                         Ok(quote! { cuda_rust_wasm::runtime::warp_shuffle_up(#value, #delta) })
                     },
                     WarpOp::ShuffleDown => {
-                        if args.len() != 2 {
-                            return Err(translation_error!("Warp shuffle_down requires 2 arguments"));
-                        }
-                        let value = self.generate_expression(&args[0])?;
-                        let delta = self.generate_expression(&args[1])?;
+                        // __shfl_down_sync(mask, value, delta) -> use (value, delta)
+                        let (value, delta) = if args.len() == 3 {
+                            (self.generate_expression(&args[1])?, self.generate_expression(&args[2])?)
+                        } else if args.len() == 2 {
+                            (self.generate_expression(&args[0])?, self.generate_expression(&args[1])?)
+                        } else {
+                            return Err(translation_error!("Warp shuffle_down requires 2 or 3 arguments"));
+                        };
                         Ok(quote! { cuda_rust_wasm::runtime::warp_shuffle_down(#value, #delta) })
                     },
                     WarpOp::Vote => {
@@ -476,10 +512,10 @@ impl CodeGenerator {
             UnaryOp::Not => quote! { ! },
             UnaryOp::Neg => quote! { - },
             UnaryOp::BitNot => quote! { ! },
-            UnaryOp::PreInc => quote! { ++ },
-            UnaryOp::PreDec => quote! { -- },
-            UnaryOp::PostInc => return Err(translation_error!("Post-increment not supported")),
-            UnaryOp::PostDec => return Err(translation_error!("Post-decrement not supported")),
+            UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec => {
+                // Handled in generate_expression
+                return Err(translation_error!("Inc/Dec handled in expression generator"));
+            },
             UnaryOp::Deref => quote! { * },
             UnaryOp::AddrOf => quote! { & },
         })

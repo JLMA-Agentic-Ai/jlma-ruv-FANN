@@ -119,7 +119,8 @@ impl WgslGenerator {
         self.writeln("// Map CUDA thread/block indices to WGSL")?;
         self.writeln("let threadIdx = local_id;")?;
         self.writeln("let blockIdx = workgroup_id;")?;
-        self.writeln("let blockDim = vec3<u32>(64u, 1u, 1u);")?; // Match workgroup size
+        self.writeln(&format!("let blockDim = vec3<u32>({}u, {}u, {}u);",
+            self.workgroup_size.0, self.workgroup_size.1, self.workgroup_size.2))?;
         self.writeln("let gridDim = vec3<u32>(1u, 1u, 1u);")?; // Would need to be computed
         self.writeln("")?;
         
@@ -331,20 +332,34 @@ impl WgslGenerator {
                 self.write(")")?;
             },
             Expression::Unary { op, expr } => {
-                self.write("(")?;
-                self.write(self.unary_op_to_wgsl(op)?)?;
-                self.generate_expression(expr)?;
-                self.write(")")?;
+                match op {
+                    UnaryOp::PreInc | UnaryOp::PostInc => {
+                        self.generate_expression(expr)?;
+                        self.write(" += 1")?;
+                    },
+                    UnaryOp::PreDec | UnaryOp::PostDec => {
+                        self.generate_expression(expr)?;
+                        self.write(" -= 1")?;
+                    },
+                    _ => {
+                        self.write("(")?;
+                        self.write(self.unary_op_to_wgsl(op)?)?;
+                        self.generate_expression(expr)?;
+                        self.write(")")?;
+                    }
+                }
             },
             Expression::Call { name, args } => {
-                self.write(&format!("{name}("))?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ")?;
+                if self.generate_atomic_call(name, args)? {
+                    // Handled as atomic/sync builtin
+                } else {
+                    self.write(&format!("{name}("))?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 { self.write(", ")?; }
+                        self.generate_expression(arg)?;
                     }
-                    self.generate_expression(arg)?;
+                    self.write(")")?;
                 }
-                self.write(")")?;
             },
             Expression::Index { array, index } => {
                 self.generate_expression(array)?;
@@ -375,17 +390,26 @@ impl WgslGenerator {
                 self.write(&format!("gridDim.{}", self.dimension_to_wgsl(dim)))?;
             },
             Expression::WarpPrimitive { op, args } => {
-                // WGSL doesn't have direct warp primitives, emit a comment
-                self.write(&format!("/* warp_{op:?}("))?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ")?;
+                match op {
+                    WarpOp::ActiveMask => self.write("subgroupBallot(true)")?,
+                    _ => {
+                        let func = match op {
+                            WarpOp::Shuffle => "subgroupShuffle",
+                            WarpOp::ShuffleXor => "subgroupShuffleXor",
+                            WarpOp::ShuffleUp => "subgroupShuffleUp",
+                            WarpOp::ShuffleDown => "subgroupShuffleDown",
+                            WarpOp::Vote => "subgroupAll",
+                            WarpOp::Ballot => "subgroupBallot",
+                            WarpOp::ActiveMask => unreachable!(),
+                        };
+                        self.write(&format!("{func}("))?;
+                        for (i, arg) in args.iter().enumerate() {
+                            if i > 0 { self.write(", ")?; }
+                            self.generate_expression(arg)?;
+                        }
+                        self.write(")")?;
                     }
-                    self.generate_expression(arg)?;
                 }
-                self.write(") */")?;
-                // Emit a placeholder value
-                self.write("0")?;
             },
         }
         
@@ -479,7 +503,6 @@ impl WgslGenerator {
         })
     }
     
-    /// Convert dimension to WGSL component
     fn dimension_to_wgsl(&self, dim: &Dimension) -> &'static str {
         match dim {
             Dimension::X => "x",
@@ -487,7 +510,39 @@ impl WgslGenerator {
             Dimension::Z => "z",
         }
     }
-    
+
+    /// Handle atomic builtins and __syncthreads. Returns true if handled.
+    fn generate_atomic_call(&mut self, name: &str, args: &[Expression]) -> Result<bool> {
+        let wgsl_name = match name {
+            "atomicAdd" => "atomicAdd",
+            "atomicSub" => "atomicSub",
+            "atomicMin" => "atomicMin",
+            "atomicMax" => "atomicMax",
+            "atomicExch" => "atomicExchange",
+            "__syncthreads" => {
+                self.write("workgroupBarrier()")?;
+                return Ok(true);
+            },
+            "atomicCAS" => {
+                self.write("atomicCompareExchangeWeak(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { self.write(", ")?; }
+                    self.generate_expression(arg)?;
+                }
+                self.write(").old_value")?;
+                return Ok(true);
+            },
+            _ => return Ok(false),
+        };
+        self.write(&format!("{wgsl_name}("))?;
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 { self.write(", ")?; }
+            self.generate_expression(arg)?;
+        }
+        self.write(")")?;
+        Ok(true)
+    }
+
     /// Helper: Write with indentation
     fn write(&mut self, s: &str) -> Result<()> {
         self.code.push_str(s);

@@ -1476,6 +1476,68 @@ fn parse_preprocessor(input: &str) -> IResult<&str, ()> {
 //  Top-level parser
 // ═══════════════════════════════════════════════════════════════
 
+/// Parse a top-level global variable declaration (__constant__ or __shared__)
+fn parse_global_var_decl(input: &str) -> IResult<&str, Item> {
+    let (input, _) = ws(input)?;
+    // Only match __constant__ or __shared__ at top level
+    let rest = input;
+    let storage;
+    let rest = if let Ok((r, _)) = tag::<&str, &str, nom::error::Error<&str>>("__constant__")(rest) {
+        storage = StorageClass::Constant;
+        r
+    } else if let Ok((r, _)) = tag::<&str, &str, nom::error::Error<&str>>("__shared__")(rest) {
+        storage = StorageClass::Shared;
+        r
+    } else {
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+    };
+    let (rest, _) = ws(rest)?;
+    let (rest, (mut ty, _qualifiers)) = parse_type(rest)?;
+    let (rest, _) = ws(rest)?;
+    let (rest, name) = identifier(rest)?;
+    let (rest, _) = ws(rest)?;
+    // Array suffix
+    let (rest, ty) = if let Ok((r, _)) = char::<&str, nom::error::Error<&str>>('[')(rest) {
+        let (r, _) = ws(r)?;
+        let (r, size_expr) = parse_expr(r)?;
+        let (r, _) = ws(r)?;
+        let (r, _) = char(']')(r)?;
+        let size = if let Expression::Literal(Literal::Int(n)) = &size_expr {
+            Some(*n as usize)
+        } else {
+            None
+        };
+        (r, Type::Array(Box::new(ty), size))
+    } else {
+        (rest, ty)
+    };
+    let (rest, _) = ws(rest)?;
+    // Optional initializer
+    let (rest, init) = if let Ok((r, _)) = char::<&str, nom::error::Error<&str>>('=')(rest) {
+        let (r, _) = ws(r)?;
+        // Handle brace-enclosed initializers: {1.0, 2.0, ...}
+        if r.starts_with('{') {
+            // Skip to matching }
+            let end = r.find('}').unwrap_or(r.len() - 1);
+            let r = &r[end + 1..];
+            (r, None) // We don't parse initializer lists into AST yet
+        } else {
+            let (r, expr) = parse_expr(r)?;
+            (r, Some(expr))
+        }
+    } else {
+        (rest, None)
+    };
+    let (rest, _) = ws(rest)?;
+    let (rest, _) = char(';')(rest)?;
+    Ok((rest, Item::GlobalVar(GlobalVar {
+        name: name.to_string(),
+        ty,
+        storage,
+        init,
+    })))
+}
+
 fn parse_top_level_item(input: &str) -> IResult<&str, Option<Item>> {
     let (input, _) = ws(input)?;
     if input.is_empty() {
@@ -1484,6 +1546,10 @@ fn parse_top_level_item(input: &str) -> IResult<&str, Option<Item>> {
 
     // Try each top-level construct
     if let Ok((r, item)) = parse_include(input) {
+        return Ok((r, Some(item)));
+    }
+    // Global vars before kernels (so __constant__ is not skipped)
+    if let Ok((r, item)) = parse_global_var_decl(input) {
         return Ok((r, Some(item)));
     }
     if let Ok((r, item)) = parse_kernel_def(input) {
