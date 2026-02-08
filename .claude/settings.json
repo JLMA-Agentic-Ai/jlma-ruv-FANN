@@ -1,103 +1,203 @@
 {
-  "env": {
-    "CLAUDE_FLOW_AUTO_COMMIT": "false",
-    "CLAUDE_FLOW_AUTO_PUSH": "false",
-    "CLAUDE_FLOW_HOOKS_ENABLED": "true",
-    "CLAUDE_FLOW_TELEMETRY_ENABLED": "true",
-    "CLAUDE_FLOW_REMOTE_EXECUTION": "true",
-    "CLAUDE_FLOW_GITHUB_INTEGRATION": "true"
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/helpers/hook-handler.cjs pre-bash",
+            "timeout": 5,
+            "statusMessage": "Checking command safety"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/helpers/hook-handler.cjs post-edit",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/helpers/hook-handler.cjs route",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/helpers/hook-handler.cjs session-restore",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/helpers/hook-handler.cjs session-end",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo agent-started",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo ok",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node .claude/helpers/statusline.cjs"
   },
   "permissions": {
     "allow": [
-      "Bash(npx claude-flow *)",
-      "Bash(npm run lint)",
-      "Bash(npm run test:*)",
-      "Bash(npm test *)",
-      "Bash(git status)",
-      "Bash(git diff *)",
-      "Bash(git log *)",
-      "Bash(git add *)",
-      "Bash(git commit *)",
-      "Bash(git push)",
-      "Bash(git config *)",
-      "Bash(gh *)",
-      "Bash(node *)",
-      "Bash(which *)",
-      "Bash(pwd)",
-      "Bash(ls *)"
+      "Bash(npx @claude-flow*)",
+      "Bash(npx claude-flow*)",
+      "Bash(node .claude/*)",
+      "MCP(claude-flow)"
     ],
     "deny": [
-      "Bash(rm -rf /)",
-      "Bash(curl * | bash)",
-      "Bash(wget * | sh)",
-      "Bash(eval *)"
+      "Read(./.env)",
+      "Read(./.env.*)"
     ]
   },
-  "hooks": {
-    "preEditHook": {
-      "command": "npx",
-      "args": ["claude-flow", "hooks", "pre-edit", "--file", "${file}", "--auto-assign-agents", "true", "--load-context", "true"],
-      "alwaysRun": false,
-      "outputFormat": "json"
-    },
-    "postEditHook": {
-      "command": "npx",
-      "args": ["claude-flow", "hooks", "post-edit", "--file", "${file}", "--format", "true", "--update-memory", "true", "--train-neural", "true"],
-      "alwaysRun": true,
-      "outputFormat": "json"
-    },
-    "preCommandHook": {
-      "command": "npx",
-      "args": ["claude-flow", "hooks", "pre-command", "--command", "${command}", "--validate-safety", "true", "--prepare-resources", "true"],
-      "alwaysRun": false,
-      "outputFormat": "json"
-    },
-    "postCommandHook": {
-      "command": "npx",
-      "args": ["claude-flow", "hooks", "post-command", "--command", "${command}", "--track-metrics", "true", "--store-results", "true"],
-      "alwaysRun": false,
-      "outputFormat": "json"
-    },
-    "sessionEndHook": {
-      "command": "npx",
-      "args": ["claude-flow", "hooks", "session-end", "--generate-summary", "true", "--persist-state", "true", "--export-metrics", "true"],
-      "alwaysRun": true,
-      "outputFormat": "json"
-    }
+  "attribution": {
+    "commit": "Co-Authored-By: claude-flow <ruv@ruv.net>",
+    "pr": "Generated with [claude-flow](https://github.com/ruvnet/claude-flow)"
   },
-  "mcpServers": {
-    "claude-flow": {
-      "command": "npx",
-      "args": [
-        "claude-flow",
-        "mcp",
-        "start"
+  "claudeFlow": {
+    "version": "3.0.0",
+    "enabled": true,
+    "modelPreferences": {
+      "default": "claude-opus-4-5-20251101",
+      "routing": "claude-3-5-haiku-20241022"
+    },
+    "swarm": {
+      "topology": "hierarchical-mesh",
+      "maxAgents": 15
+    },
+    "memory": {
+      "backend": "hybrid",
+      "enableHNSW": true
+    },
+    "neural": {
+      "enabled": true
+    },
+    "daemon": {
+      "autoStart": true,
+      "workers": [
+        "map",
+        "audit",
+        "optimize",
+        "consolidate",
+        "testgaps",
+        "ultralearn",
+        "deepdive",
+        "document",
+        "refactor",
+        "benchmark"
       ],
-      "env": {
-        "CLAUDE_FLOW_HOOKS_ENABLED": "true",
-        "CLAUDE_FLOW_TELEMETRY_ENABLED": "true",
-        "CLAUDE_FLOW_REMOTE_READY": "true",
-        "CLAUDE_FLOW_GITHUB_INTEGRATION": "true"
+      "schedules": {
+        "audit": {
+          "interval": "1h",
+          "priority": "critical"
+        },
+        "optimize": {
+          "interval": "30m",
+          "priority": "high"
+        },
+        "consolidate": {
+          "interval": "2h",
+          "priority": "low"
+        },
+        "document": {
+          "interval": "1h",
+          "priority": "normal",
+          "triggers": [
+            "adr-update",
+            "api-change"
+          ]
+        },
+        "deepdive": {
+          "interval": "4h",
+          "priority": "normal",
+          "triggers": [
+            "complex-change"
+          ]
+        },
+        "ultralearn": {
+          "interval": "1h",
+          "priority": "normal"
+        }
       }
+    },
+    "learning": {
+      "enabled": true,
+      "autoTrain": true,
+      "patterns": [
+        "coordination",
+        "optimization",
+        "prediction"
+      ],
+      "retention": {
+        "shortTerm": "24h",
+        "longTerm": "30d"
+      }
+    },
+    "adr": {
+      "autoGenerate": true,
+      "directory": "/docs/adr",
+      "template": "madr"
+    },
+    "ddd": {
+      "trackDomains": true,
+      "validateBoundedContexts": true,
+      "directory": "/docs/ddd"
+    },
+    "security": {
+      "autoScan": true,
+      "scanOnEdit": true,
+      "cveCheck": true,
+      "threatModel": true
     }
-  },
-  "includeCoAuthoredBy": true,
-  "features": {
-    "autoTopologySelection": true,
-    "parallelExecution": true,
-    "neuralTraining": true,
-    "bottleneckAnalysis": true,
-    "smartAutoSpawning": true,
-    "selfHealingWorkflows": true,
-    "crossSessionMemory": true,
-    "githubIntegration": true
-  },
-  "performance": {
-    "maxAgents": 10,
-    "defaultTopology": "hierarchical",
-    "executionStrategy": "parallel",
-    "tokenOptimization": true,
-    "cacheEnabled": true,
-    "telemetryLevel": "detailed"
   }
 }
