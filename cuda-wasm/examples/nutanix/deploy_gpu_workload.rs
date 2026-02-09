@@ -44,7 +44,7 @@ fn get_config_from_env() -> NutanixConfig {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== cuda-wasm Nutanix GPU Workload Deployment ===\n");
 

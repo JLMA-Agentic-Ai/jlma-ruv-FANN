@@ -16,6 +16,7 @@ use super::config::{GpuNode, GpuVendor};
 /// resources. Naming follows the NVIDIA MIG / AMD partition conventions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[allow(non_camel_case_types)]
 pub enum VgpuProfile {
     /// NVIDIA A100 1g.5gb - 1/7 GPU, 5 GB memory
     A100_1g5gb,

@@ -451,7 +451,7 @@ pub fn gpu_resource_key(vendor: &GpuVendor) -> &'static str {
 fn format_yaml_map(map: &HashMap<String, String>, indent: usize) -> String {
     let prefix = " ".repeat(indent);
     let mut pairs: Vec<_> = map.iter().collect();
-    pairs.sort_by_key(|(k, _)| k.clone());
+    pairs.sort_by_key(|(k, _)| (*k).clone());
 
     pairs
         .iter()

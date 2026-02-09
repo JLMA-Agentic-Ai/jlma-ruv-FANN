@@ -3,7 +3,7 @@
 //! This crate provides a complete toolchain for translating CUDA code to Rust,
 //! with support for WebGPU backends and WASM compilation.
 
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 // Allow unsafe code for low-level memory operations
 #![allow(unsafe_code)]
 

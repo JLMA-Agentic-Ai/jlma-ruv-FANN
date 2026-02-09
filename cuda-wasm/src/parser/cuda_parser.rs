@@ -1492,7 +1492,7 @@ fn parse_global_var_decl(input: &str) -> IResult<&str, Item> {
         return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
     };
     let (rest, _) = ws(rest)?;
-    let (rest, (mut ty, _qualifiers)) = parse_type(rest)?;
+    let (rest, (ty, _qualifiers)) = parse_type(rest)?;
     let (rest, _) = ws(rest)?;
     let (rest, name) = identifier(rest)?;
     let (rest, _) = ws(rest)?;
