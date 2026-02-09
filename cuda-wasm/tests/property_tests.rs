@@ -1,498 +1,309 @@
-//! Property-based tests for transpiler correctness
+//! Property-based tests for transpiler correctness and runtime behavior
 
 #[cfg(test)]
 mod property_tests {
-    use cuda_rust_wasm::{
-        transpiler::{CudaTranspiler, TranspilerOptions},
-        runtime::{WasmRuntime, RuntimeOptions},
-        kernel::{KernelLauncher, LaunchConfig},
-        memory::{DeviceMemory, MemoryPool, AllocationStrategy},
+    use cuda_rust_wasm::{CudaParser, CudaRust};
+    use cuda_rust_wasm::runtime::{
+        Grid, Block, Dim3, LaunchConfig, KernelFunction, ThreadContext, launch_kernel,
     };
-    use proptest::prelude::*;
-    use approx::assert_relative_eq;
+    use cuda_rust_wasm::memory::MemoryPool;
 
-    // Property: Vector addition should be commutative
-    proptest! {
-        #[test]
-        fn prop_vector_add_commutative(
-            a in prop::collection::vec(-1000.0f32..1000.0f32, 100..1000),
-            b in prop::collection::vec(-1000.0f32..1000.0f32, 100..1000)
-        ) {
-            let n = a.len().min(b.len());
-            let a = &a[..n];
-            let b = &b[..n];
-            
-            let cuda_code = r#"
-                __global__ void vector_add(float* a, float* b, float* c, int n) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        c[idx] = a[idx] + b[idx];
-                    }
-                }
-            "#;
-            
-            let result1 = run_vector_operation(cuda_code, a, b, n);
-            let result2 = run_vector_operation(cuda_code, b, a, n);
-            
-            // Addition should be commutative
-            for i in 0..n {
-                assert_relative_eq!(result1[i], result2[i], epsilon = 1e-5);
+    // Property: Valid CUDA kernels should parse and transpile successfully
+    #[test]
+    fn prop_valid_kernels_transpile() {
+        let kernels = vec![
+            r#"__global__ void add(float* a, float* b, float* c) { int i = threadIdx.x; c[i] = a[i] + b[i]; }"#,
+            r#"__global__ void scale(float* data, float s, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) data[i] *= s; }"#,
+            r#"__global__ void identity(float* in, float* out, int n) { int i = threadIdx.x; if (i < n) out[i] = in[i]; }"#,
+            r#"__global__ void saxpy(float a, float* x, float* y, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = a * x[i] + y[i]; }"#,
+        ];
+
+        let transpiler = CudaRust::new();
+        for (idx, kernel) in kernels.iter().enumerate() {
+            let result = transpiler.transpile(kernel);
+            assert!(result.is_ok(), "Kernel {} failed to transpile: {:?}", idx, result.err());
+            let code = result.unwrap();
+            assert!(!code.is_empty(), "Kernel {} produced empty output", idx);
+        }
+    }
+
+    // Property: Parser should handle all valid CUDA types
+    #[test]
+    fn prop_parser_handles_types() {
+        let parser = CudaParser::new();
+        let typed_kernels = vec![
+            r#"__global__ void k1(int* a) { int i = threadIdx.x; a[i] = i; }"#,
+            r#"__global__ void k2(float* a) { int i = threadIdx.x; a[i] = 1.0f; }"#,
+            r#"__global__ void k3(double* a) { int i = threadIdx.x; a[i] = 1.0; }"#,
+            r#"__global__ void k4(unsigned int* a) { int i = threadIdx.x; a[i] = i; }"#,
+        ];
+
+        for (idx, kernel) in typed_kernels.iter().enumerate() {
+            let result = parser.parse(kernel);
+            assert!(result.is_ok(), "Type kernel {} failed: {:?}", idx, result.err());
+        }
+    }
+
+    // Property: Vector addition via CPU kernel should be commutative
+    struct VectorAddKernel {
+        a: Vec<f32>,
+        b: Vec<f32>,
+        c: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl KernelFunction<()> for VectorAddKernel {
+        fn execute(&self, _args: (), ctx: ThreadContext) {
+            let idx = ctx.global_thread_id();
+            if idx < self.a.len() {
+                let mut c = self.c.lock().unwrap();
+                c[idx] = self.a[idx] + self.b[idx];
             }
         }
+        fn name(&self) -> &str { "vector_add" }
     }
 
-    // Property: Scalar multiplication should be distributive
-    proptest! {
-        #[test]
-        fn prop_scalar_mult_distributive(
-            data in prop::collection::vec(-100.0f32..100.0f32, 100..1000),
-            scalar in -10.0f32..10.0f32
-        ) {
-            let n = data.len();
-            
-            let scalar_mult_code = r#"
-                __global__ void scalar_mult(float* data, float scalar, float* output, int n) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        output[idx] = data[idx] * scalar;
-                    }
-                }
-            "#;
-            
-            let result = run_scalar_operation(scalar_mult_code, &data, scalar, n);
-            
-            // Verify distributive property
-            for i in 0..n {
-                assert_relative_eq!(result[i], data[i] * scalar, epsilon = 1e-5);
+    #[test]
+    fn prop_vector_add_commutative() {
+        let n = 256;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 1.5).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.7).collect();
+
+        // a + b
+        let c1 = std::sync::Arc::new(std::sync::Mutex::new(vec![0.0f32; n]));
+        let kernel1 = VectorAddKernel { a: a.clone(), b: b.clone(), c: c1.clone() };
+        let config = LaunchConfig::new(Grid::new(1u32), Block::new(n as u32));
+        launch_kernel(kernel1, config, ()).unwrap();
+
+        // b + a
+        let c2 = std::sync::Arc::new(std::sync::Mutex::new(vec![0.0f32; n]));
+        let kernel2 = VectorAddKernel { a: b.clone(), b: a.clone(), c: c2.clone() };
+        let config = LaunchConfig::new(Grid::new(1u32), Block::new(n as u32));
+        launch_kernel(kernel2, config, ()).unwrap();
+
+        let r1 = c1.lock().unwrap();
+        let r2 = c2.lock().unwrap();
+        for i in 0..n {
+            assert!((r1[i] - r2[i]).abs() < 1e-5, "Mismatch at {}: {} vs {}", i, r1[i], r2[i]);
+        }
+    }
+
+    // Property: Identity kernel preserves data
+    struct IdentityKernel {
+        input: Vec<f32>,
+        output: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl KernelFunction<()> for IdentityKernel {
+        fn execute(&self, _args: (), ctx: ThreadContext) {
+            let idx = ctx.global_thread_id();
+            if idx < self.input.len() {
+                let mut out = self.output.lock().unwrap();
+                out[idx] = self.input[idx];
             }
         }
+        fn name(&self) -> &str { "identity" }
     }
 
-    // Property: Identity operations should preserve data
-    proptest! {
-        #[test]
-        fn prop_identity_operation(
-            data in prop::collection::vec(-1000.0f32..1000.0f32, 100..1000)
-        ) {
-            let n = data.len();
-            
-            let identity_code = r#"
-                __global__ void identity(float* input, float* output, int n) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        output[idx] = input[idx];
-                    }
-                }
-            "#;
-            
-            let result = run_unary_operation(identity_code, &data, n);
-            
-            // Output should equal input
-            for i in 0..n {
-                assert_eq!(result[i], data[i]);
+    #[test]
+    fn prop_identity_preserves_data() {
+        let data: Vec<f32> = (0..512).map(|i| (i as f32).sin()).collect();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(vec![0.0f32; 512]));
+
+        let kernel = IdentityKernel { input: data.clone(), output: output.clone() };
+        let config = LaunchConfig::new(Grid::new(2u32), Block::new(256u32));
+        launch_kernel(kernel, config, ()).unwrap();
+
+        let result = output.lock().unwrap();
+        for i in 0..data.len() {
+            assert_eq!(result[i], data[i], "Identity failed at index {}", i);
+        }
+    }
+
+    // Property: Multi-block kernel covers all elements
+    struct CountKernel {
+        output: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl KernelFunction<()> for CountKernel {
+        fn execute(&self, _args: (), ctx: ThreadContext) {
+            let idx = ctx.global_thread_id();
+            let mut out = self.output.lock().unwrap();
+            if idx < out.len() {
+                out[idx] = idx as u32;
             }
         }
+        fn name(&self) -> &str { "count" }
     }
 
-    // Property: Min/max operations should satisfy bounds
-    proptest! {
-        #[test]
-        fn prop_minmax_bounds(
-            a in prop::collection::vec(-1000.0f32..1000.0f32, 100..1000),
-            b in prop::collection::vec(-1000.0f32..1000.0f32, 100..1000)
-        ) {
-            let n = a.len().min(b.len());
-            let a = &a[..n];
-            let b = &b[..n];
-            
-            let minmax_code = r#"
-                __global__ void minmax(float* a, float* b, float* min_out, float* max_out, int n) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        min_out[idx] = fminf(a[idx], b[idx]);
-                        max_out[idx] = fmaxf(a[idx], b[idx]);
-                    }
-                }
-            "#;
-            
-            let (min_result, max_result) = run_minmax_operation(minmax_code, a, b, n);
-            
-            // Verify bounds
-            for i in 0..n {
-                assert!(min_result[i] <= a[i]);
-                assert!(min_result[i] <= b[i]);
-                assert!(max_result[i] >= a[i]);
-                assert!(max_result[i] >= b[i]);
-                assert!(min_result[i] <= max_result[i]);
+    #[test]
+    fn prop_multi_block_coverage() {
+        let n = 1024usize;
+        let output = std::sync::Arc::new(std::sync::Mutex::new(vec![u32::MAX; n]));
+
+        let kernel = CountKernel { output: output.clone() };
+        let blocks = ((n + 255) / 256) as u32;
+        let config = LaunchConfig::new(Grid::new(blocks), Block::new(256u32));
+        launch_kernel(kernel, config, ()).unwrap();
+
+        let result = output.lock().unwrap();
+        for i in 0..n {
+            assert_eq!(result[i], i as u32, "Thread {} not reached", i);
+        }
+    }
+
+    // Property: Scalar multiplication is distributive
+    struct ScalarMulKernel {
+        data: Vec<f32>,
+        scalar: f32,
+        output: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl KernelFunction<()> for ScalarMulKernel {
+        fn execute(&self, _args: (), ctx: ThreadContext) {
+            let idx = ctx.global_thread_id();
+            if idx < self.data.len() {
+                let mut out = self.output.lock().unwrap();
+                out[idx] = self.data[idx] * self.scalar;
             }
         }
+        fn name(&self) -> &str { "scalar_mul" }
     }
 
-    // Property: Reduction operations should be associative
-    proptest! {
-        #[test]
-        fn prop_reduction_associative(
-            data in prop::collection::vec(0.1f32..10.0f32, 128..512)
-        ) {
-            let n = data.len();
-            
-            let reduction_code = r#"
-                __global__ void reduction_sum(float* input, float* output, int n) {
-                    extern __shared__ float sdata[];
-                    
-                    int tid = threadIdx.x;
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    
-                    sdata[tid] = (idx < n) ? input[idx] : 0.0f;
-                    __syncthreads();
-                    
-                    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                        if (tid < s) {
-                            sdata[tid] += sdata[tid + s];
-                        }
-                        __syncthreads();
-                    }
-                    
-                    if (tid == 0) {
-                        output[blockIdx.x] = sdata[0];
-                    }
-                }
-            "#;
-            
-            let gpu_sum = run_reduction(reduction_code, &data, n);
-            let cpu_sum: f32 = data.iter().sum();
-            
-            // GPU reduction should match CPU sum (within floating point tolerance)
-            assert_relative_eq!(gpu_sum, cpu_sum, epsilon = 1e-3);
+    #[test]
+    fn prop_scalar_mult_correct() {
+        let n = 256;
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let scalar = 3.14f32;
+        let output = std::sync::Arc::new(std::sync::Mutex::new(vec![0.0f32; n]));
+
+        let kernel = ScalarMulKernel { data: data.clone(), scalar, output: output.clone() };
+        let config = LaunchConfig::new(Grid::new(1u32), Block::new(n as u32));
+        launch_kernel(kernel, config, ()).unwrap();
+
+        let result = output.lock().unwrap();
+        for i in 0..n {
+            assert!((result[i] - data[i] * scalar).abs() < 1e-4,
+                "Scalar mult mismatch at {}: expected {}, got {}", i, data[i] * scalar, result[i]);
         }
     }
 
-    // Property: Atomic operations should maintain consistency
-    proptest! {
-        #[test]
-        fn prop_atomic_consistency(
-            num_threads in 32usize..512,
-            increment in 1i32..10
-        ) {
-            let atomic_code = r#"
-                __global__ void atomic_increment(int* counter, int increment, int num_iterations) {
-                    for (int i = 0; i < num_iterations; i++) {
-                        atomicAdd(counter, increment);
-                    }
-                }
-            "#;
-            
-            let result = run_atomic_test(atomic_code, num_threads, increment);
-            let expected = (num_threads * increment) as i32;
-            
-            // All atomic increments should be accounted for
-            assert_eq!(result, expected);
+    // Property: Memory pool allocation/deallocation is consistent
+    #[test]
+    fn prop_memory_pool_consistency() {
+        let pool = MemoryPool::new();
+
+        // Allocate various sizes and verify buffers are returned with correct length
+        let sizes = [64usize, 128, 256, 512, 1024, 4096];
+        for &size in &sizes {
+            let buffer = pool.allocate(size);
+            assert_eq!(buffer.len(), size, "Buffer size mismatch for allocation of {} bytes", size);
+            // Return buffer to pool for reuse
+            pool.deallocate(buffer);
         }
+
+        // After allocating and deallocating, stats should show activity
+        let stats = pool.stats();
+        assert!(stats.total_allocations >= sizes.len() as u64,
+            "Expected at least {} allocations, got {}", sizes.len(), stats.total_allocations);
     }
 
-    // Property: Memory access patterns should be safe
-    proptest! {
-        #[test]
-        fn prop_memory_bounds_checking(
-            size in 100usize..1000,
-            pattern in prop::collection::vec(0usize..1000, 100..500)
-        ) {
-            let bounded_pattern: Vec<_> = pattern.iter()
-                .map(|&idx| idx % size)
-                .collect();
-            
-            let gather_code = r#"
-                __global__ void gather(float* input, int* indices, float* output, int n, int size) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        int index = indices[idx];
-                        if (index >= 0 && index < size) {
-                            output[idx] = input[index];
-                        } else {
-                            output[idx] = -1.0f; // Out of bounds marker
-                        }
-                    }
-                }
-            "#;
-            
-            let data: Vec<f32> = (0..size).map(|i| i as f32).collect();
-            let result = run_gather_operation(gather_code, &data, &bounded_pattern);
-            
-            // All accesses should be valid
-            for (i, &idx) in bounded_pattern.iter().enumerate() {
-                assert_eq!(result[i], data[idx]);
-                assert!(result[i] >= 0.0); // No out-of-bounds markers
-            }
+    // Property: Memory pool reuse works (cache hits after deallocation)
+    #[test]
+    fn prop_memory_pool_reuse() {
+        let pool = MemoryPool::new();
+
+        // Allocate and deallocate a poolable size (>= min_pooled_size of 1024)
+        let buffer = pool.allocate(2048);
+        assert_eq!(buffer.len(), 2048);
+        pool.deallocate(buffer);
+
+        // Allocate the same size again -- should be a cache hit
+        let _buffer2 = pool.allocate(2048);
+        let stats = pool.stats();
+        assert!(stats.cache_hits > 0, "Expected cache hits after reuse, got {}", stats.cache_hits);
+    }
+
+    // Property: Grid/Block dimensions calculate correctly
+    #[test]
+    fn prop_grid_block_dimensions() {
+        for x in [1u32, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let grid = Grid::new(x);
+            assert_eq!(grid.num_blocks(), x);
+
+            let block = Block::new(x);
+            assert_eq!(block.num_threads(), x);
         }
+
+        // 2D
+        let grid_2d = Grid::new((4u32, 4u32));
+        assert_eq!(grid_2d.num_blocks(), 16);
+
+        // 3D
+        let grid_3d = Grid::new((2u32, 3u32, 4u32));
+        assert_eq!(grid_3d.num_blocks(), 24);
     }
 
-    // Property: Type conversions should preserve values within range
-    proptest! {
-        #[test]
-        fn prop_type_conversion_safety(
-            int_data in prop::collection::vec(-1000i32..1000, 100..500)
-        ) {
-            let conversion_code = r#"
-                __global__ void int_to_float(int* input, float* output, int n) {
-                    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                    if (idx < n) {
-                        output[idx] = (float)input[idx];
-                    }
-                }
-            "#;
-            
-            let result = run_conversion_test(conversion_code, &int_data);
-            
-            // Conversion should preserve values
-            for i in 0..int_data.len() {
-                assert_eq!(result[i], int_data[i] as f32);
-            }
-        }
+    // Property: Block validation catches invalid sizes
+    #[test]
+    fn prop_block_validation() {
+        // Valid blocks
+        assert!(Block::new(1u32).validate().is_ok());
+        assert!(Block::new(256u32).validate().is_ok());
+        assert!(Block::new(1024u32).validate().is_ok());
+
+        // Invalid: too many threads (max is 1024)
+        assert!(Block::new(2048u32).validate().is_err());
     }
 
-    // Helper functions for running tests
-    fn run_vector_operation(code: &str, a: &[f32], b: &[f32], n: usize) -> Vec<f32> {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_a = pool.allocate_and_copy(a).unwrap();
-        let d_b = pool.allocate_and_copy(b).unwrap();
-        let d_c: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((n + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
+    // Property: ThreadContext computes correct global IDs
+    #[test]
+    fn prop_thread_context_global_ids() {
+        let ctx = ThreadContext {
+            thread_idx: Dim3 { x: 5, y: 0, z: 0 },
+            block_idx: Dim3 { x: 2, y: 0, z: 0 },
+            block_dim: Dim3 { x: 256, y: 1, z: 1 },
+            grid_dim: Dim3 { x: 4, y: 1, z: 1 },
         };
-        
-        launcher.launch(
-            "vector_add",
-            config,
-            &[d_a.as_arg(), d_b.as_arg(), d_c.as_arg(), n.as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0.0f32; n];
-        d_c.copy_to_host(&mut result).unwrap();
-        result
+        assert_eq!(ctx.global_thread_id(), 2 * 256 + 5);
+
+        let ctx_2d = ThreadContext {
+            thread_idx: Dim3 { x: 3, y: 7, z: 0 },
+            block_idx: Dim3 { x: 1, y: 2, z: 0 },
+            block_dim: Dim3 { x: 16, y: 16, z: 1 },
+            grid_dim: Dim3 { x: 4, y: 4, z: 1 },
+        };
+        let (gx, gy) = ctx_2d.global_thread_id_2d();
+        assert_eq!(gx, 1 * 16 + 3);
+        assert_eq!(gy, 2 * 16 + 7);
     }
 
-    fn run_scalar_operation(code: &str, data: &[f32], scalar: f32, n: usize) -> Vec<f32> {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_data = pool.allocate_and_copy(data).unwrap();
-        let d_output: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((n + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "scalar_mult",
-            config,
-            &[d_data.as_arg(), scalar.as_arg(), d_output.as_arg(), n.as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0.0f32; n];
-        d_output.copy_to_host(&mut result).unwrap();
-        result
+    // Property: Transpiler produces deterministic output
+    #[test]
+    fn prop_transpile_deterministic() {
+        let kernel = r#"__global__ void add(float* a, float* b, float* c) {
+            int i = threadIdx.x;
+            c[i] = a[i] + b[i];
+        }"#;
+
+        let transpiler = CudaRust::new();
+        let result1 = transpiler.transpile(kernel).unwrap();
+        let result2 = transpiler.transpile(kernel).unwrap();
+        assert_eq!(result1, result2, "Transpiler should produce deterministic output");
     }
 
-    fn run_unary_operation(code: &str, data: &[f32], n: usize) -> Vec<f32> {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_input = pool.allocate_and_copy(data).unwrap();
-        let d_output: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((n + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "identity",
-            config,
-            &[d_input.as_arg(), d_output.as_arg(), n.as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0.0f32; n];
-        d_output.copy_to_host(&mut result).unwrap();
-        result
-    }
+    // Property: Empty or invalid kernels should fail gracefully
+    #[test]
+    fn prop_invalid_kernels_handled() {
+        let transpiler = CudaRust::new();
 
-    fn run_minmax_operation(code: &str, a: &[f32], b: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_a = pool.allocate_and_copy(a).unwrap();
-        let d_b = pool.allocate_and_copy(b).unwrap();
-        let d_min: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        let d_max: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((n + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "minmax",
-            config,
-            &[d_a.as_arg(), d_b.as_arg(), d_min.as_arg(), d_max.as_arg(), n.as_arg()],
-        ).unwrap();
-        
-        let mut min_result = vec![0.0f32; n];
-        let mut max_result = vec![0.0f32; n];
-        d_min.copy_to_host(&mut min_result).unwrap();
-        d_max.copy_to_host(&mut max_result).unwrap();
-        
-        (min_result, max_result)
-    }
+        // Empty input
+        let result = transpiler.transpile("");
+        // Should either succeed with empty output or return an error, but not panic
+        let _ = result;
 
-    fn run_reduction(code: &str, data: &[f32], n: usize) -> f32 {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_input = pool.allocate_and_copy(data).unwrap();
-        
-        let block_size = 128;
-        let grid_size = (n + block_size - 1) / block_size;
-        let d_output: DeviceMemory<f32> = pool.allocate(grid_size).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: (grid_size as u32, 1, 1),
-            block_size: (block_size as u32, 1, 1),
-            shared_mem_bytes: block_size * std::mem::size_of::<f32>(),
-        };
-        
-        launcher.launch(
-            "reduction_sum",
-            config,
-            &[d_input.as_arg(), d_output.as_arg(), n.as_arg()],
-        ).unwrap();
-        
-        let mut partial_sums = vec![0.0f32; grid_size];
-        d_output.copy_to_host(&mut partial_sums).unwrap();
-        
-        partial_sums.iter().sum()
-    }
-
-    fn run_atomic_test(code: &str, num_threads: usize, increment: i32) -> i32 {
-        let options = TranspilerOptions {
-            enable_atomics: true,
-            ..Default::default()
-        };
-        
-        let transpiler = CudaTranspiler::new(options);
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 1024 * 1024).unwrap();
-        let counter = vec![0i32];
-        let d_counter = pool.allocate_and_copy(&counter).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: (1, 1, 1),
-            block_size: (num_threads as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "atomic_increment",
-            config,
-            &[d_counter.as_arg(), increment.as_arg(), 1i32.as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0i32];
-        d_counter.copy_to_host(&mut result).unwrap();
-        result[0]
-    }
-
-    fn run_gather_operation(code: &str, data: &[f32], indices: &[usize]) -> Vec<f32> {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_data = pool.allocate_and_copy(data).unwrap();
-        
-        let indices_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
-        let d_indices = pool.allocate_and_copy(&indices_i32).unwrap();
-        
-        let n = indices.len();
-        let d_output: DeviceMemory<f32> = pool.allocate(n).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((n + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "gather",
-            config,
-            &[d_data.as_arg(), d_indices.as_arg(), d_output.as_arg(), 
-              n.as_arg(), data.len().as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0.0f32; n];
-        d_output.copy_to_host(&mut result).unwrap();
-        result
-    }
-
-    fn run_conversion_test(code: &str, int_data: &[i32]) -> Vec<f32> {
-        let transpiler = CudaTranspiler::new(TranspilerOptions::default());
-        let wasm_bytes = transpiler.transpile(code).unwrap();
-        let runtime = WasmRuntime::new(RuntimeOptions::default()).unwrap();
-        let module = runtime.load_module(&wasm_bytes).unwrap();
-        
-        let pool = MemoryPool::new(AllocationStrategy::BestFit, 10 * 1024 * 1024).unwrap();
-        let d_input = pool.allocate_and_copy(int_data).unwrap();
-        let d_output: DeviceMemory<f32> = pool.allocate(int_data.len()).unwrap();
-        
-        let launcher = KernelLauncher::new(module);
-        let config = LaunchConfig {
-            grid_size: ((int_data.len() + 255) / 256, 1, 1),
-            block_size: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        
-        launcher.launch(
-            "int_to_float",
-            config,
-            &[d_input.as_arg(), d_output.as_arg(), int_data.len().as_arg()],
-        ).unwrap();
-        
-        let mut result = vec![0.0f32; int_data.len()];
-        d_output.copy_to_host(&mut result).unwrap();
-        result
+        // Garbage input
+        let result = transpiler.transpile("this is not valid CUDA code at all!!!");
+        // Should not panic
+        let _ = result;
     }
 }

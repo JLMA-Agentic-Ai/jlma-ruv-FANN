@@ -845,7 +845,7 @@ mod tests {
     fn test_vector_kernels() {
         let vector_kernel = OptimizedKernels::vector_operations_kernel();
         assert!(vector_kernel.contains("optimized_vector_add"));
-        assert!(vector_kernel.contains("grid-stride loop"));
+        assert!(vector_kernel.contains("Grid-stride loop"));
     }
     
     #[test]

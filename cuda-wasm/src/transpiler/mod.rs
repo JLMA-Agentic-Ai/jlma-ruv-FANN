@@ -72,17 +72,10 @@ impl CudaTranspiler {
     }
     
     /// Generate WebGPU shader from CUDA source
-    #[cfg(feature = "webgpu-only")]
     pub fn generate_wgsl(&self, cuda_source: &str) -> Result<String> {
         use crate::parser::CudaParser;
         let parser = CudaParser::new();
         let ast = parser.parse(cuda_source)?;
         self.inner.to_wgsl(ast)
-    }
-    
-    /// Generate WebGPU shader from CUDA source (fallback)
-    #[cfg(not(feature = "webgpu-only"))]
-    pub fn generate_wgsl(&self, _cuda_source: &str) -> Result<String> {
-        Ok("// WGSL generation requires webgpu-only feature".to_string())
     }
 }

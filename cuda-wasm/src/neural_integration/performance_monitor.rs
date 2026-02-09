@@ -113,6 +113,15 @@ impl Default for MonitorConfig {
 }
 
 impl RealTimeMonitor {
+    /// Get current process memory usage in bytes (RSS from /proc/self/statm).
+    fn process_memory_bytes() -> usize {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+            .map(|pages| pages * 4096)
+            .unwrap_or(0)
+    }
+
     /// Create a new real-time performance monitor
     pub fn new() -> NeuralResult<Self> {
         Self::with_config(MonitorConfig::default())
@@ -284,7 +293,7 @@ impl PerformanceMonitorTrait for RealTimeMonitor {
             name: name.to_string(),
             start_time: Instant::now(),
             gpu_start: None,
-            memory_start: 0, // TODO: Get actual memory usage
+            memory_start: Self::process_memory_bytes(),
             expected_duration: self.get_expected_duration(name),
         };
         
@@ -314,9 +323,11 @@ impl PerformanceMonitorTrait for RealTimeMonitor {
         let end_time = Instant::now();
         let execution_time = end_time.duration_since(ongoing.start_time);
         
-        // TODO: Get actual GPU and memory transfer times
-        let gpu_time = execution_time * 7 / 10; // Assume 70% GPU time
-        let memory_transfer_time = execution_time * 2 / 10; // Assume 20% transfer time
+        // Use GPU start time if recorded, otherwise estimate from execution profile
+        let gpu_time = ongoing.gpu_start
+            .map(|gs| end_time.duration_since(gs))
+            .unwrap_or(execution_time * 8 / 10);
+        let memory_transfer_time = execution_time.saturating_sub(gpu_time);
         
         let throughput = 1.0 / execution_time.as_secs_f64(); // Operations per second
         
@@ -327,7 +338,7 @@ impl PerformanceMonitorTrait for RealTimeMonitor {
             memory_transfer_time,
             throughput,
             timestamp: end_time,
-            memory_usage: 0, // TODO: Get actual memory usage
+            memory_usage: Self::process_memory_bytes().saturating_sub(ongoing.memory_start),
             success: true, // TODO: Determine success based on context
         };
         
@@ -377,7 +388,11 @@ impl PerformanceMonitorTrait for RealTimeMonitor {
             total_operations: history.total_operations,
             average_execution_time: total_time.as_secs_f64() / history.total_operations as f64,
             gpu_utilization: (total_gpu_time.as_secs_f64() / total_time.as_secs_f64()) as f32,
-            memory_bandwidth: 0.0, // TODO: Calculate actual memory bandwidth
+            memory_bandwidth: {
+                let total_mem: usize = history.operations.iter().map(|op| op.memory_usage).sum();
+                let total_secs = total_time.as_secs_f64();
+                if total_secs > 0.0 { total_mem as f64 / total_secs / (1024.0 * 1024.0 * 1024.0) } else { 0.0 }
+            },
             throughput: total_throughput / history.total_operations as f64,
         }
     }
@@ -550,7 +565,7 @@ fn calculate_std_dev(values: &[f64]) -> f64 {
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     let variance = values.iter()
         .map(|&x| (x - mean).powi(2))
-        .sum::<f64>() / values.len() as f64;
+        .sum::<f64>() / (values.len() - 1) as f64;
     
     variance.sqrt()
 }

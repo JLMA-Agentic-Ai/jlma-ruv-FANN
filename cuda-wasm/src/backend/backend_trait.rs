@@ -23,7 +23,7 @@ pub struct BackendCapabilities {
 }
 
 /// Common interface for all backends
-#[async_trait]
+#[async_trait(?Send)]
 pub trait BackendTrait: Send + Sync {
     /// Get backend name
     fn name(&self) -> &str;
