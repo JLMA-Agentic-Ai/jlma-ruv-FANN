@@ -6,6 +6,12 @@ pub mod kernel;
 pub mod stream;
 pub mod event;
 pub mod grid;
+pub mod cooperative_groups;
+pub mod dynamic_parallelism;
+pub mod cuda_graph;
+pub mod multi_gpu;
+pub mod half;
+pub mod benchmark;
 
 use crate::{Result, runtime_error};
 use std::cell::RefCell;

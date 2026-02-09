@@ -4,11 +4,13 @@ pub mod device_memory;
 pub mod host_memory;
 pub mod unified_memory;
 pub mod memory_pool;
+pub mod texture_memory;
 
 pub use device_memory::DeviceBuffer;
 pub use host_memory::HostBuffer;
 pub use unified_memory::UnifiedMemory;
 pub use memory_pool::{MemoryPool, PoolConfig, PoolStats, KernelMemoryManager, global_pool, allocate, deallocate};
+pub use texture_memory::{TextureMemory, TextureDescriptor, AddressMode, FilterMode};
 
 use std::cell::RefCell;
 
