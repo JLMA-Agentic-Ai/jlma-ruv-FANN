@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-09T02:55:41.237Z",
+  "timestamp": "2026-02-09T03:10:41.243Z",
   "projectRoot": "/home/user/ruv-FANN",
   "structure": {
     "hasPackageJson": true,
@@ -7,5 +7,5 @@
     "hasClaudeConfig": true,
     "hasClaudeFlow": true
   },
-  "scannedAt": 1770605741238
+  "scannedAt": 1770606641244
 }
