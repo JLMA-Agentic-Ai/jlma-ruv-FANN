@@ -11,7 +11,16 @@ pub mod dynamic_parallelism;
 pub mod cuda_graph;
 pub mod multi_gpu;
 pub mod half;
+pub mod bfloat16;
 pub mod benchmark;
+pub mod flash_attention;
+pub mod tensor_ops;
+pub mod kernel_fusion;
+pub mod occupancy;
+pub mod async_pipeline;
+pub mod quantization;
+pub mod warp_intrinsics;
+pub mod coalescing;
 
 use crate::{Result, runtime_error};
 use std::cell::RefCell;
