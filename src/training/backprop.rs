@@ -9,10 +9,9 @@ use std::collections::HashMap;
 pub struct IncrementalBackprop<T: Float + Send + Default> {
     learning_rate: T,
     momentum: T,
-    error_function: Box<dyn ErrorFunction<T>>,
+    base: TrainerBase<T>,
     previous_weight_deltas: Vec<Vec<T>>,
     previous_bias_deltas: Vec<Vec<T>>,
-    callback: Option<TrainingCallback<T>>,
 }
 
 impl<T: Float + Send + Default> IncrementalBackprop<T> {
@@ -20,10 +19,9 @@ impl<T: Float + Send + Default> IncrementalBackprop<T> {
         Self {
             learning_rate,
             momentum: T::zero(),
-            error_function: Box::new(MseError),
+            base: TrainerBase::new(Box::new(MseError)),
             previous_weight_deltas: Vec::new(),
             previous_bias_deltas: Vec::new(),
-            callback: None,
         }
     }
 
@@ -33,7 +31,7 @@ impl<T: Float + Send + Default> IncrementalBackprop<T> {
     }
 
     pub fn with_error_function(mut self, error_function: Box<dyn ErrorFunction<T>>) -> Self {
-        self.error_function = error_function;
+        self.base.error_function = error_function;
         self
     }
 
@@ -86,14 +84,14 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
             let output = &activations[activations.len() - 1];
 
             // Calculate error
-            total_error = total_error + self.error_function.calculate(output, desired_output);
+            total_error = total_error + self.base.error_function.calculate(output, desired_output);
 
             // Calculate gradients using backpropagation
             let (weight_gradients, bias_gradients) = calculate_gradients(
                 &simple_network,
                 &activations,
                 desired_output,
-                self.error_function.as_ref(),
+                self.base.error_function.as_ref(),
             );
 
             // Update weights and biases immediately (incremental/online learning)
@@ -126,15 +124,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
     }
 
     fn calculate_error(&self, network: &Network<T>, data: &TrainingData<T>) -> T {
-        let mut total_error = T::zero();
-        let mut network_clone = network.clone();
-
-        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-            let output = network_clone.run(input);
-            total_error = total_error + self.error_function.calculate(&output, desired_output);
-        }
-
-        total_error / T::from(data.inputs.len()).unwrap()
+        self.base.calculate_error(network, data)
     }
 
     fn count_bit_fails(
@@ -143,19 +133,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
         data: &TrainingData<T>,
         bit_fail_limit: T,
     ) -> usize {
-        let mut bit_fails = 0;
-        let mut network_clone = network.clone();
-
-        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-            let output = network_clone.run(input);
-            for (&actual, &desired) in output.iter().zip(desired_output.iter()) {
-                if (actual - desired).abs() > bit_fail_limit {
-                    bit_fails += 1;
-                }
-            }
-        }
-
-        bit_fails
+        self.base.count_bit_fails(network, data, bit_fail_limit)
     }
 
     fn save_state(&self) -> TrainingState<T> {
@@ -184,7 +162,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
     }
 
     fn set_callback(&mut self, callback: TrainingCallback<T>) {
-        self.callback = Some(callback);
+        self.base.set_callback(callback);
     }
 
     fn call_callback(
@@ -193,12 +171,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
         network: &Network<T>,
         data: &TrainingData<T>,
     ) -> bool {
-        let error = self.calculate_error(network, data);
-        if let Some(ref mut callback) = self.callback {
-            callback(epoch, error)
-        } else {
-            true
-        }
+        self.base.call_callback(epoch, network, data)
     }
 }
 
@@ -207,10 +180,9 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for IncrementalBackprop<T> 
 pub struct BatchBackprop<T: Float + Send + Default> {
     learning_rate: T,
     momentum: T,
-    error_function: Box<dyn ErrorFunction<T>>,
+    base: TrainerBase<T>,
     previous_weight_deltas: Vec<Vec<T>>,
     previous_bias_deltas: Vec<Vec<T>>,
-    callback: Option<TrainingCallback<T>>,
 }
 
 impl<T: Float + Send + Default> BatchBackprop<T> {
@@ -218,10 +190,9 @@ impl<T: Float + Send + Default> BatchBackprop<T> {
         Self {
             learning_rate,
             momentum: T::zero(),
-            error_function: Box::new(MseError),
+            base: TrainerBase::new(Box::new(MseError)),
             previous_weight_deltas: Vec::new(),
             previous_bias_deltas: Vec::new(),
-            callback: None,
         }
     }
 
@@ -231,7 +202,7 @@ impl<T: Float + Send + Default> BatchBackprop<T> {
     }
 
     pub fn with_error_function(mut self, error_function: Box<dyn ErrorFunction<T>>) -> Self {
-        self.error_function = error_function;
+        self.base.error_function = error_function;
         self
     }
 
@@ -297,14 +268,14 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for BatchBackprop<T> {
             let output = &activations[activations.len() - 1];
 
             // Calculate error
-            total_error = total_error + self.error_function.calculate(output, desired_output);
+            total_error = total_error + self.base.error_function.calculate(output, desired_output);
 
             // Calculate gradients using backpropagation
             let (weight_gradients, bias_gradients) = calculate_gradients(
                 &simple_network,
                 &activations,
                 desired_output,
-                self.error_function.as_ref(),
+                self.base.error_function.as_ref(),
             );
 
             // Accumulate gradients
@@ -368,15 +339,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for BatchBackprop<T> {
     }
 
     fn calculate_error(&self, network: &Network<T>, data: &TrainingData<T>) -> T {
-        let mut total_error = T::zero();
-        let mut network_clone = network.clone();
-
-        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-            let output = network_clone.run(input);
-            total_error = total_error + self.error_function.calculate(&output, desired_output);
-        }
-
-        total_error / T::from(data.inputs.len()).unwrap()
+        self.base.calculate_error(network, data)
     }
 
     fn count_bit_fails(
@@ -385,19 +348,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for BatchBackprop<T> {
         data: &TrainingData<T>,
         bit_fail_limit: T,
     ) -> usize {
-        let mut bit_fails = 0;
-        let mut network_clone = network.clone();
-
-        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-            let output = network_clone.run(input);
-            for (&actual, &desired) in output.iter().zip(desired_output.iter()) {
-                if (actual - desired).abs() > bit_fail_limit {
-                    bit_fails += 1;
-                }
-            }
-        }
-
-        bit_fails
+        self.base.count_bit_fails(network, data, bit_fail_limit)
     }
 
     fn save_state(&self) -> TrainingState<T> {
@@ -426,7 +377,7 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for BatchBackprop<T> {
     }
 
     fn set_callback(&mut self, callback: TrainingCallback<T>) {
-        self.callback = Some(callback);
+        self.base.set_callback(callback);
     }
 
     fn call_callback(
@@ -435,11 +386,6 @@ impl<T: Float + Send + Default> TrainingAlgorithm<T> for BatchBackprop<T> {
         network: &Network<T>,
         data: &TrainingData<T>,
     ) -> bool {
-        let error = self.calculate_error(network, data);
-        if let Some(ref mut callback) = self.callback {
-            callback(epoch, error)
-        } else {
-            true
-        }
+        self.base.call_callback(epoch, network, data)
     }
 }

@@ -20,6 +20,12 @@ pub enum NetworkError {
 
     #[error("Network has no layers")]
     NoLayers,
+
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
+
+    #[error("Data size mismatch: expected {expected} samples for inputs and outputs, got {actual}")]
+    DataSizeMismatch { expected: usize, actual: usize },
 }
 
 /// A feedforward neural network
@@ -79,13 +85,17 @@ impl<T: Float> Network<T> {
         self.total_connections()
     }
 
-    /// Runs a forward pass through the network
+    /// Runs a forward pass through the network.
     ///
     /// # Arguments
     /// * `inputs` - Input values for the network
     ///
     /// # Returns
-    /// Output values from the network
+    /// `Ok(Vec<T>)` with the output values, or a `NetworkError` on failure.
+    ///
+    /// # Errors
+    /// * [`NetworkError::NoLayers`] -- the network has no layers.
+    /// * [`NetworkError::InputSizeMismatch`] -- `inputs.len()` does not match the input layer.
     ///
     /// # Example
     /// ```
@@ -98,17 +108,21 @@ impl<T: Float> Network<T> {
     ///     .build();
     ///
     /// let inputs = vec![0.5, 0.7];
-    /// let outputs = network.run(&inputs);
+    /// let outputs = network.run(&inputs).unwrap();
     /// assert_eq!(outputs.len(), 1);
     /// ```
-    pub fn run(&mut self, inputs: &[T]) -> Vec<T> {
+    pub fn run(&mut self, inputs: &[T]) -> Result<Vec<T>, NetworkError> {
         if self.layers.is_empty() {
-            return Vec::new();
+            return Err(NetworkError::NoLayers);
         }
 
         // Set input layer values
+        let expected = self.layers[0].num_regular_neurons();
         if self.layers[0].set_inputs(inputs).is_err() {
-            return Vec::new();
+            return Err(NetworkError::InputSizeMismatch {
+                expected,
+                actual: inputs.len(),
+            });
         }
 
         // Forward propagate through each layer
@@ -118,16 +132,26 @@ impl<T: Float> Network<T> {
         }
 
         // Return output layer values (excluding bias if present)
-        if let Some(output_layer) = self.layers.last() {
-            output_layer
-                .neurons
-                .iter()
-                .filter(|n| !n.is_bias)
-                .map(|n| n.value)
-                .collect()
-        } else {
-            Vec::new()
-        }
+        Ok(self
+            .layers
+            .last()
+            .map(|output_layer| {
+                output_layer
+                    .neurons
+                    .iter()
+                    .filter(|n| !n.is_bias)
+                    .map(|n| n.value)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Runs a forward pass without returning errors.
+    ///
+    /// This is a convenience wrapper around [`run`](Self::run) that silently
+    /// returns an empty `Vec` on failure, preserving the pre-1.0 behaviour.
+    pub fn run_unchecked(&mut self, inputs: &[T]) -> Vec<T> {
+        self.run(inputs).unwrap_or_default()
     }
 
     /// Gets all weights in the network as a flat vector
@@ -264,7 +288,10 @@ impl<T: Float> Network<T> {
         T: std::ops::AddAssign + std::ops::SubAssign + std::ops::MulAssign + std::cmp::PartialOrd,
     {
         if inputs.len() != outputs.len() {
-            return Err(NetworkError::InvalidLayerConfiguration);
+            return Err(NetworkError::DataSizeMismatch {
+                expected: inputs.len(),
+                actual: outputs.len(),
+            });
         }
 
         let lr = T::from(learning_rate as f64).unwrap_or(T::from(0.1).unwrap_or(T::one()));
@@ -395,19 +422,27 @@ impl<T: Float> Network<T> {
         }
     }
 
-    /// Run batch inference on multiple inputs
+    /// Run batch inference on multiple inputs.
+    ///
+    /// Uses [`run_unchecked`](Self::run_unchecked) internally so that an
+    /// invalid single input does not abort the entire batch.
     pub fn run_batch(&mut self, inputs: &[Vec<T>]) -> Vec<Vec<T>> {
-        inputs.iter().map(|input| self.run(input)).collect()
+        inputs
+            .iter()
+            .map(|input| self.run_unchecked(input))
+            .collect()
     }
 
     /// Serialize the network to bytes
     #[cfg(all(feature = "binary", feature = "serde"))]
-    pub fn to_bytes(&self) -> Vec<u8>
+    pub fn to_bytes(&self) -> Result<Vec<u8>, NetworkError>
     where
         T: serde::Serialize,
         Network<T>: serde::Serialize,
     {
-        bincode::serialize(self).unwrap_or_default()
+        bincode::serialize(self).map_err(|e| {
+            NetworkError::InvalidLayerConfiguration
+        })
     }
 
     #[cfg(feature = "binary")]
@@ -417,14 +452,53 @@ impl<T: Float> Network<T> {
         Vec::new()
     }
 
-    /// Deserialize a network from bytes
+    /// Default maximum size for deserialization (256 MB)
+    const FROM_BYTES_MAX: u64 = 256 * 1024 * 1024;
+
+    /// Deserialize a network from bytes with bounded deserialization and
+    /// post-deserialization validation.
     #[cfg(all(feature = "binary", feature = "serde"))]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NetworkError>
     where
         T: serde::de::DeserializeOwned,
         Network<T>: serde::de::DeserializeOwned,
     {
-        bincode::deserialize(bytes).map_err(|_| NetworkError::InvalidLayerConfiguration)
+        use bincode::Options;
+
+        if bytes.len() as u64 > Self::FROM_BYTES_MAX {
+            return Err(NetworkError::InvalidLayerConfiguration);
+        }
+
+        // Use options compatible with bincode::serialize() defaults
+        let options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .allow_trailing_bytes()
+            .with_limit(Self::FROM_BYTES_MAX);
+        let network: Self = options
+            .deserialize(bytes)
+            .map_err(|_| NetworkError::InvalidLayerConfiguration)?;
+
+        // Validate network structure post-deserialize
+        if network.layers.is_empty() {
+            return Err(NetworkError::NoLayers);
+        }
+        for layer in &network.layers {
+            if layer.size() == 0 {
+                return Err(NetworkError::InvalidLayerConfiguration);
+            }
+            // Validate connections reference valid neuron indices
+            for neuron in &layer.neurons {
+                for conn in &neuron.connections {
+                    if conn.from_neuron >= layer.size() + 1024 {
+                        // Allow some headroom but catch clearly invalid indices
+                        return Err(NetworkError::InvalidLayerConfiguration);
+                    }
+                }
+            }
+        }
+
+        Ok(network)
     }
 
     #[cfg(feature = "binary")]
@@ -602,7 +676,7 @@ mod tests {
             .build();
 
         let inputs = vec![0.5, 0.7];
-        let outputs = network.run(&inputs);
+        let outputs = network.run(&inputs).unwrap();
         assert_eq!(outputs.len(), 1);
     }
 

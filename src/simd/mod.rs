@@ -10,6 +10,7 @@
 //! - Better cache utilization through blocking
 //! - Multi-threading support with rayon
 
+pub use crate::ActivationFunction;
 use num_traits::Float;
 use std::sync::Arc;
 
@@ -81,16 +82,8 @@ pub trait SimdMatrixOps<T: Float + Send + Sync> {
     );
 }
 
-/// Supported activation functions for SIMD optimization
-#[derive(Debug, Clone, Copy)]
-pub enum ActivationFunction {
-    Sigmoid,
-    Tanh,
-    Relu,
-    LeakyRelu(f32),
-    Gelu,
-    Swish,
-}
+/// Default leaky ReLU alpha used by SIMD kernels.
+const LEAKY_RELU_ALPHA: f32 = 0.01;
 
 /// CPU-based SIMD implementation
 pub struct CpuSimdOps {
@@ -204,6 +197,21 @@ impl SimdMatrixOps<f32> for CpuSimdOps {
 impl CpuSimdOps {
     /// Scalar fallback for matrix multiplication
     fn matmul_scalar(&self, a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        debug_assert!(
+            a.len() >= m * k,
+            "matmul_scalar: a.len() ({}) < m*k ({}*{}={})",
+            a.len(), m, k, m * k
+        );
+        debug_assert!(
+            b.len() >= k * n,
+            "matmul_scalar: b.len() ({}) < k*n ({}*{}={})",
+            b.len(), k, n, k * n
+        );
+        debug_assert!(
+            c.len() >= m * n,
+            "matmul_scalar: c.len() ({}) < m*n ({}*{}={})",
+            c.len(), m, n, m * n
+        );
         // Initialize output to zero
         c.fill(0.0);
 
@@ -242,6 +250,9 @@ impl CpuSimdOps {
         n: usize,
         k: usize,
     ) {
+        debug_assert!(a.len() >= m * k, "matmul_avx2: a.len() < m*k");
+        debug_assert!(b.len() >= k * n, "matmul_avx2: b.len() < k*n");
+        debug_assert!(c.len() >= m * n, "matmul_avx2: c.len() < m*n");
         // Initialize output to zero
         c.fill(0.0);
 
@@ -294,6 +305,9 @@ impl CpuSimdOps {
 
     /// Scalar matrix-vector multiplication
     fn matvec_scalar(&self, a: &[f32], x: &[f32], y: &mut [f32], m: usize, n: usize) {
+        debug_assert!(a.len() >= m * n, "matvec_scalar: a.len() < m*n");
+        debug_assert!(x.len() >= n, "matvec_scalar: x.len() < n");
+        debug_assert!(y.len() >= m, "matvec_scalar: y.len() < m");
         for i in 0..m {
             let mut sum = 0.0;
             for j in 0..n {
@@ -306,6 +320,9 @@ impl CpuSimdOps {
     /// AVX2 optimized matrix-vector multiplication
     #[cfg(target_arch = "x86_64")]
     unsafe fn matvec_avx2(&self, a: &[f32], x: &[f32], y: &mut [f32], m: usize, n: usize) {
+        debug_assert!(a.len() >= m * n, "matvec_avx2: a.len() < m*n");
+        debug_assert!(x.len() >= n, "matvec_avx2: x.len() < n");
+        debug_assert!(y.len() >= m, "matvec_avx2: y.len() < m");
         const SIMD_WIDTH: usize = 8;
 
         for i in 0..m {
@@ -339,6 +356,8 @@ impl CpuSimdOps {
 
     /// Scalar bias addition
     fn add_bias_scalar(&self, matrix: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
+        debug_assert!(matrix.len() >= rows * cols, "add_bias_scalar: matrix.len() < rows*cols");
+        debug_assert!(bias.len() >= cols, "add_bias_scalar: bias.len() < cols");
         for i in 0..rows {
             for j in 0..cols {
                 matrix[i * cols + j] += bias[j];
@@ -349,6 +368,8 @@ impl CpuSimdOps {
     /// AVX2 optimized bias addition
     #[cfg(target_arch = "x86_64")]
     unsafe fn add_bias_avx2(&self, matrix: &mut [f32], bias: &[f32], rows: usize, cols: usize) {
+        debug_assert!(matrix.len() >= rows * cols, "add_bias_avx2: matrix.len() < rows*cols");
+        debug_assert!(bias.len() >= cols, "add_bias_avx2: bias.len() < cols");
         const SIMD_WIDTH: usize = 8;
 
         for i in 0..rows {
@@ -378,7 +399,7 @@ impl CpuSimdOps {
     /// Scalar activation function application
     fn apply_activation_scalar(&self, data: &mut [f32], activation: ActivationFunction) {
         match activation {
-            ActivationFunction::Sigmoid => {
+            ActivationFunction::Sigmoid | ActivationFunction::SigmoidSymmetric => {
                 for x in data.iter_mut() {
                     *x = 1.0 / (1.0 + (-*x).exp());
                 }
@@ -388,19 +409,19 @@ impl CpuSimdOps {
                     *x = x.tanh();
                 }
             }
-            ActivationFunction::Relu => {
+            ActivationFunction::ReLU => {
                 for x in data.iter_mut() {
                     *x = x.max(0.0);
                 }
             }
-            ActivationFunction::LeakyRelu(alpha) => {
+            ActivationFunction::LeakyRelu | ActivationFunction::ReLULeaky => {
+                let alpha = LEAKY_RELU_ALPHA;
                 for x in data.iter_mut() {
                     *x = if *x > 0.0 { *x } else { alpha * *x };
                 }
             }
             ActivationFunction::Gelu => {
                 for x in data.iter_mut() {
-                    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
                     let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
                     *x = *x * 0.5 * (1.0 + (sqrt_2_over_pi * (*x + 0.044715 * x.powi(3))).tanh());
                 }
@@ -409,6 +430,10 @@ impl CpuSimdOps {
                 for x in data.iter_mut() {
                     *x = *x / (1.0 + (-*x).exp());
                 }
+            }
+            // For activation functions without a specialized SIMD path, use a linear fallback
+            _ => {
+                // Linear / no-op for unsupported activations in the SIMD path
             }
         }
     }
@@ -421,7 +446,7 @@ impl CpuSimdOps {
         let mut i = 0;
 
         match activation {
-            ActivationFunction::Relu => {
+            ActivationFunction::ReLU => {
                 let zero = _mm256_setzero_ps();
 
                 while i + SIMD_WIDTH <= len {
@@ -442,7 +467,7 @@ impl CpuSimdOps {
         // Handle remaining elements
         while i < len {
             match activation {
-                ActivationFunction::Relu => {
+                ActivationFunction::ReLU => {
                     data[i] = data[i].max(0.0);
                 }
                 _ => unreachable!(),
@@ -458,8 +483,13 @@ impl CpuSimdOps {
         derivatives: &mut [f32],
         activation: ActivationFunction,
     ) {
+        debug_assert!(
+            derivatives.len() >= data.len(),
+            "activation_derivatives_scalar: derivatives.len() ({}) < data.len() ({})",
+            derivatives.len(), data.len()
+        );
         match activation {
-            ActivationFunction::Sigmoid => {
+            ActivationFunction::Sigmoid | ActivationFunction::SigmoidSymmetric => {
                 for (i, &x) in data.iter().enumerate() {
                     derivatives[i] = x * (1.0 - x);
                 }
@@ -469,12 +499,13 @@ impl CpuSimdOps {
                     derivatives[i] = 1.0 - x * x;
                 }
             }
-            ActivationFunction::Relu => {
+            ActivationFunction::ReLU => {
                 for (i, &x) in data.iter().enumerate() {
                     derivatives[i] = if x > 0.0 { 1.0 } else { 0.0 };
                 }
             }
-            ActivationFunction::LeakyRelu(alpha) => {
+            ActivationFunction::LeakyRelu | ActivationFunction::ReLULeaky => {
+                let alpha = LEAKY_RELU_ALPHA;
                 for (i, &x) in data.iter().enumerate() {
                     derivatives[i] = if x > 0.0 { 1.0 } else { alpha };
                 }
@@ -498,6 +529,12 @@ impl CpuSimdOps {
                     derivatives[i] = sigmoid * (1.0 + x * (1.0 - sigmoid));
                 }
             }
+            // For activation functions without a specialized derivative, default to 1.0 (linear)
+            _ => {
+                for (i, _) in data.iter().enumerate() {
+                    derivatives[i] = 1.0;
+                }
+            }
         }
     }
 
@@ -509,12 +546,16 @@ impl CpuSimdOps {
         derivatives: &mut [f32],
         activation: ActivationFunction,
     ) {
+        debug_assert!(
+            derivatives.len() >= data.len(),
+            "activation_derivatives_avx2: derivatives.len() < data.len()"
+        );
         const SIMD_WIDTH: usize = 8;
         let len = data.len();
         let mut i = 0;
 
         match activation {
-            ActivationFunction::Relu => {
+            ActivationFunction::ReLU => {
                 let zero = _mm256_setzero_ps();
                 let one = _mm256_set1_ps(1.0);
 
@@ -540,7 +581,7 @@ impl CpuSimdOps {
         // Handle remaining elements
         while i < len {
             match activation {
-                ActivationFunction::Relu => {
+                ActivationFunction::ReLU => {
                     derivatives[i] = if data[i] > 0.0 { 1.0 } else { 0.0 };
                 }
                 _ => unreachable!(),
@@ -659,7 +700,7 @@ mod tests {
         let ops = CpuSimdOps::new_with_defaults();
         let mut data = vec![-1.0, 0.0, 1.0, -2.0, 3.0];
 
-        ops.apply_activation(&mut data, ActivationFunction::Relu);
+        ops.apply_activation(&mut data, ActivationFunction::ReLU);
 
         assert_eq!(data, vec![0.0, 0.0, 1.0, 0.0, 3.0]);
     }
@@ -670,7 +711,7 @@ mod tests {
         let data = vec![-1.0, 0.0, 1.0, -2.0, 3.0];
         let mut derivatives = vec![0.0; 5];
 
-        ops.activation_derivatives(&data, &mut derivatives, ActivationFunction::Relu);
+        ops.activation_derivatives(&data, &mut derivatives, ActivationFunction::ReLU);
 
         assert_eq!(derivatives, vec![0.0, 0.0, 1.0, 0.0, 1.0]);
     }

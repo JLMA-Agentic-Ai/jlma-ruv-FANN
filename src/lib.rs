@@ -39,6 +39,7 @@ pub mod activation;
 pub mod cascade;
 pub mod connection;
 pub mod errors;
+#[cfg(test)]
 pub mod integration;
 pub mod layer;
 pub mod memory_manager;
@@ -54,12 +55,13 @@ pub mod io;
 pub mod webgpu;
 
 // SIMD acceleration module (CPU optimizations)
-#[cfg(feature = "parallel")]
+#[cfg(any(feature = "simd", feature = "parallel"))]
 pub mod simd;
 
 // Test module
 #[cfg(test)]
 mod tests;
 
-// Mock types for testing
+// Mock types used by the io module
+#[cfg(feature = "io")]
 pub mod mock_types;

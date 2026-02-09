@@ -579,7 +579,7 @@ impl<T: Float> CascadeTrainer<T> {
 
         for (input, target) in inputs.iter().zip(outputs.iter()) {
             // Forward pass
-            let output = self.network.run(input);
+            let output = self.network.run_unchecked(input);
             self.metrics.total_forward_passes += 1;
 
             // Calculate error
@@ -730,7 +730,7 @@ impl<T: Float> CascadeTrainer<T> {
             .iter()
             .zip(self.training_data.outputs.iter())
         {
-            let output = self.network.run(input);
+            let output = self.network.run_unchecked(input);
             let residual: Vec<T> = output
                 .iter()
                 .zip(target.iter())

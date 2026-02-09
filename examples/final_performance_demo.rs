@@ -167,7 +167,7 @@ where
                     let outputs = data
                         .inputs
                         .iter()
-                        .map(|input| network.run(input)[0])
+                        .map(|input| network.run(input).unwrap()[0])
                         .collect::<Vec<_>>();
                     println!(
                         "  Epoch {:3}: Error={:.6} Outputs=[{:.2}, {:.2}, {:.2}, {:.2}]",

@@ -144,6 +144,10 @@ test-core = ["std", "parallel"]
 test-gpu = ["gpu", "webgpu"]
 test-no-external = []  # For tests that don't require external crates
 
+[[bench]]
+name = "neural_network"
+harness = false
+
 [[example]]
 name = "basic_usage"
 path = "examples/basic_usage.rs"

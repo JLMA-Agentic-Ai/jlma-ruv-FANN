@@ -543,7 +543,7 @@ impl<T: Float + Send + Sync + Default + std::fmt::Debug + 'static> TrainingAlgor
             let mut network_clone = network.clone();
 
             for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-                let output = network_clone.run(input);
+                let output = network_clone.run_unchecked(input);
                 total_error = total_error + self.error_function.calculate(&output, desired_output);
             }
 
@@ -561,7 +561,7 @@ impl<T: Float + Send + Sync + Default + std::fmt::Debug + 'static> TrainingAlgor
         let mut network_clone = network.clone();
 
         for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
-            let output = network_clone.run(input);
+            let output = network_clone.run_unchecked(input);
             for (&actual, &desired) in output.iter().zip(desired_output.iter()) {
                 if (actual - desired).abs() > bit_fail_limit {
                     bit_fails += 1;

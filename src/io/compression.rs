@@ -35,11 +35,41 @@ pub fn compress_bytes(data: &[u8]) -> IoResult<Vec<u8>> {
     Ok(compressed)
 }
 
-/// Decompress data from bytes to bytes
+/// Default maximum decompressed size (1 GB) to prevent decompression bombs
+const DEFAULT_DECOMPRESS_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Decompress data from bytes to bytes (default 1 GB limit).
+///
+/// To specify a custom limit, use [`decompress_bytes_with_limit`].
 pub fn decompress_bytes(data: &[u8]) -> IoResult<Vec<u8>> {
+    decompress_bytes_with_limit(data, DEFAULT_DECOMPRESS_MAX_BYTES)
+}
+
+/// Decompress data from bytes to bytes with an explicit size limit.
+///
+/// Reads in chunks and aborts if the decompressed output exceeds `max_bytes`,
+/// preventing decompression bomb attacks.
+pub fn decompress_bytes_with_limit(data: &[u8], max_bytes: usize) -> IoResult<Vec<u8>> {
+    use crate::io::error::IoError;
+
     let mut decoder = GzDecoder::new(data);
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if decompressed.len() + n > max_bytes {
+            return Err(IoError::CompressionError(format!(
+                "Decompressed data exceeds size limit of {} bytes (possible decompression bomb)",
+                max_bytes
+            )));
+        }
+        decompressed.extend_from_slice(&buf[..n]);
+    }
+
     Ok(decompressed)
 }
 

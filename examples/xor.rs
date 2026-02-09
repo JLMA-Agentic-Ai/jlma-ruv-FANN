@@ -60,15 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--------------------------------------------");
 
     for (i, input) in test_inputs.iter().enumerate() {
-        let output = network.run(input);
-        if !output.is_empty() {
-            println!(
-                "{:.1} XOR {:.1}\t{:.1}\t\t{:.3}",
-                input[0], input[1], expected_outputs[i], output[0]
-            );
-        } else {
-            println!("Error: network returned empty output");
-        }
+        let output = network.run(input)?;
+        println!(
+            "{:.1} XOR {:.1}\t{:.1}\t\t{:.3}",
+            input[0], input[1], expected_outputs[i], output[0]
+        );
     }
 
     // Demonstrate weight manipulation
@@ -91,15 +87,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("--------------------------------------------");
 
             for (i, input) in test_inputs.iter().enumerate() {
-                let output = network.run(input);
-                if !output.is_empty() {
-                    println!(
-                        "{:.1} XOR {:.1}\t{:.1}\t\t{:.3}",
-                        input[0], input[1], expected_outputs[i], output[0]
-                    );
-                } else {
-                    println!("Error: network returned empty output");
-                }
+                let output = network.run(input)?;
+                println!(
+                    "{:.1} XOR {:.1}\t{:.1}\t\t{:.3}",
+                    input[0], input[1], expected_outputs[i], output[0]
+                );
             }
         }
     } else {

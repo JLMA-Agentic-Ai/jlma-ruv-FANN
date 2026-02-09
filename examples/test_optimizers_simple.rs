@@ -154,7 +154,7 @@ fn test_linear_problem() {
 fn test_network_outputs(network: &mut Network<f32>, data: &TrainingData<f32>) {
     print!("    Outputs: ");
     for (input, expected) in data.inputs.iter().zip(data.outputs.iter()) {
-        let output = network.run(input);
+        let output = network.run(input).unwrap();
         print!("{:.2} ", output[0]);
     }
     print!("  (Expected: ");

@@ -17,7 +17,7 @@ fn main() {
 
     // Run the network with some test inputs
     let inputs = vec![0.5, 0.7];
-    let outputs = network.run(&inputs);
+    let outputs = network.run(&inputs).unwrap();
 
     println!("Inputs: {inputs:?}");
     println!("Outputs: {outputs:?}");
@@ -33,7 +33,7 @@ fn main() {
         println!("Successfully updated weights");
 
         // Run again with new weights
-        let new_outputs = network.run(&inputs);
+        let new_outputs = network.run(&inputs).unwrap();
         println!("New outputs: {new_outputs:?}");
     }
 }

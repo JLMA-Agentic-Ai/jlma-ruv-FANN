@@ -379,7 +379,7 @@ impl<T: Float + Send + Default> IntegrationTestSuite<T> {
 
         // Test forward propagation
         let input = vec![T::from(0.5).unwrap(); network.num_inputs()];
-        let output = network.run(&input);
+        let output = network.run_unchecked(&input);
 
         if output.len() != network.num_outputs() {
             return Err(IntegrationError::TestFailed(format!(

@@ -1,17 +1,41 @@
 //! JSON serialization support
 
-use crate::io::error::IoResult;
+use crate::io::error::{IoError, IoResult};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-/// Read JSON data from a reader
+/// Default maximum size for JSON deserialization (256 MB)
+const DEFAULT_JSON_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read JSON data from a reader with a default size limit of 256 MB.
+///
+/// To specify a custom limit, use [`read_json_with_limit`].
 pub fn read_json<T, R>(reader: &mut R) -> IoResult<T>
 where
     T: for<'de> Deserialize<'de>,
     R: Read,
 {
+    read_json_with_limit(reader, DEFAULT_JSON_MAX_BYTES)
+}
+
+/// Read JSON data from a reader with an explicit size limit.
+///
+/// Returns an error if the input exceeds `max_bytes`.
+pub fn read_json_with_limit<T, R>(reader: &mut R, max_bytes: u64) -> IoResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+    R: Read,
+{
     let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
+    let mut limited_reader = reader.take(max_bytes.saturating_add(1));
+    limited_reader.read_to_end(&mut buffer)?;
+
+    if buffer.len() as u64 > max_bytes {
+        return Err(IoError::SerializationError(format!(
+            "JSON data exceeds size limit of {} bytes",
+            max_bytes
+        )));
+    }
 
     let value = serde_json::from_slice(&buffer)?;
     Ok(value)
@@ -28,23 +52,13 @@ where
     Ok(())
 }
 
-/// Read JSON data from a reader with custom options
-pub fn read_json_with_options<T, R>(reader: &mut R, pretty: bool) -> IoResult<T>
+/// Read JSON data from a reader with custom options (default 256 MB limit)
+pub fn read_json_with_options<T, R>(reader: &mut R, _pretty: bool) -> IoResult<T>
 where
     T: for<'de> Deserialize<'de>,
     R: Read,
 {
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
-
-    if pretty {
-        // For pretty reading, we just use the regular deserializer
-        let value = serde_json::from_slice(&buffer)?;
-        Ok(value)
-    } else {
-        let value = serde_json::from_slice(&buffer)?;
-        Ok(value)
-    }
+    read_json_with_limit(reader, DEFAULT_JSON_MAX_BYTES)
 }
 
 /// Write JSON data to a writer with custom options
