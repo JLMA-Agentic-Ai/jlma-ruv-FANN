@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-09T04:17:05.938Z",
+  "timestamp": "2026-02-09T04:32:05.942Z",
   "projectRoot": "/home/user/ruv-FANN/cuda-wasm",
   "structure": {
     "hasPackageJson": true,
@@ -7,5 +7,5 @@
     "hasClaudeConfig": true,
     "hasClaudeFlow": true
   },
-  "scannedAt": 1770610625938
+  "scannedAt": 1770611525942
 }
