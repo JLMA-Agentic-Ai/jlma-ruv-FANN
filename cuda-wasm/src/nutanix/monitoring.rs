@@ -184,7 +184,7 @@ impl GpuMonitor {
 
         #[cfg(not(feature = "nutanix"))]
         {
-            Ok(self.mock_metrics(node_id))
+            Ok(self.local_metrics(node_id))
         }
     }
 
@@ -318,7 +318,7 @@ impl GpuMonitor {
 
         #[cfg(not(feature = "nutanix"))]
         {
-            Ok(self.mock_utilization_history(node_id, duration_minutes))
+            Ok(self.local_utilization_history(node_id, duration_minutes))
         }
     }
 
@@ -341,110 +341,138 @@ impl GpuMonitor {
 
         #[cfg(not(feature = "nutanix"))]
         {
-            Ok(self.mock_capacity_forecast(cluster_id, hours_ahead))
+            Ok(self.local_capacity_forecast(cluster_id, hours_ahead))
         }
     }
 
-    // --- Mock implementations for non-nutanix builds ---
+    // --- Local system probing for non-nutanix builds ---
 
+    /// Collect GPU metrics by querying `nvidia-smi` on the local system.
+    ///
+    /// Returns an empty vector if no NVIDIA GPUs or nvidia-smi is available.
     #[cfg(not(feature = "nutanix"))]
-    fn mock_metrics(&self, _node_id: &str) -> Vec<GpuMetrics> {
-        vec![
-            GpuMetrics {
-                utilization_percent: 65.0,
-                memory_used_bytes: 30 * 1024 * 1024 * 1024,
-                memory_total_bytes: 80 * 1024 * 1024 * 1024,
-                temperature_celsius: 72.0,
-                power_watts: 250.0,
-                clock_speed_mhz: 1410,
-                fan_speed_percent: 45.0,
-                ecc_errors: 0,
-            },
-            GpuMetrics {
-                utilization_percent: 82.0,
-                memory_used_bytes: 55 * 1024 * 1024 * 1024,
-                memory_total_bytes: 80 * 1024 * 1024 * 1024,
-                temperature_celsius: 78.0,
-                power_watts: 300.0,
-                clock_speed_mhz: 1380,
-                fan_speed_percent: 60.0,
-                ecc_errors: 0,
-            },
-        ]
+    fn local_metrics(&self, _node_id: &str) -> Vec<GpuMetrics> {
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.current.graphics,fan.speed",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split(", ").collect();
+                        if parts.len() >= 7 {
+                            Some(GpuMetrics {
+                                utilization_percent: parts[0]
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0.0),
+                                memory_used_bytes: parts[1]
+                                    .trim()
+                                    .parse::<u64>()
+                                    .unwrap_or(0)
+                                    * 1024
+                                    * 1024,
+                                memory_total_bytes: parts[2]
+                                    .trim()
+                                    .parse::<u64>()
+                                    .unwrap_or(0)
+                                    * 1024
+                                    * 1024,
+                                temperature_celsius: parts[3]
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0.0),
+                                power_watts: parts[4]
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0.0),
+                                clock_speed_mhz: parts[5]
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0),
+                                fan_speed_percent: parts[6]
+                                    .trim()
+                                    .parse()
+                                    .unwrap_or(0.0),
+                                ecc_errors: 0,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
+        }
+
+        // No GPU metrics available
+        Vec::new()
     }
 
+    /// Return utilization history as a single current-time snapshot.
+    ///
+    /// Without a time-series database we cannot provide true history,
+    /// so we return one data point at the current timestamp per GPU.
     #[cfg(not(feature = "nutanix"))]
-    fn mock_utilization_history(
+    fn local_utilization_history(
         &self,
-        _node_id: &str,
-        duration_minutes: u32,
+        node_id: &str,
+        _duration_minutes: u32,
     ) -> Vec<(u64, GpuMetrics)> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-
-        let points = duration_minutes.min(60) as usize;
-        let interval_secs = (duration_minutes as u64 * 60) / points.max(1) as u64;
-
-        (0..points)
-            .map(|i| {
-                let timestamp = now - (points as u64 - i as u64) * interval_secs;
-                let utilization = 50.0 + (i as f64 * 0.5);
-                (
-                    timestamp,
-                    GpuMetrics {
-                        utilization_percent: utilization.min(100.0),
-                        memory_used_bytes: (40 + i as u64) * 1024 * 1024 * 1024,
-                        memory_total_bytes: 80 * 1024 * 1024 * 1024,
-                        temperature_celsius: 70.0 + (i as f64 * 0.2),
-                        power_watts: 200.0 + (i as f64 * 2.0),
-                        clock_speed_mhz: 1410,
-                        fan_speed_percent: 40.0 + (i as f64 * 0.5),
-                        ecc_errors: 0,
-                    },
-                )
-            })
+        self.local_metrics(node_id)
+            .into_iter()
+            .map(|m| (now, m))
             .collect()
     }
 
+    /// Generate a capacity forecast based on current local GPU utilization.
+    ///
+    /// Uses a simple linear projection with a 0.5%/hour growth assumption.
+    /// Returns a 0% utilization forecast when no GPU metrics are available.
     #[cfg(not(feature = "nutanix"))]
-    fn mock_capacity_forecast(
+    fn local_capacity_forecast(
         &self,
         cluster_id: &str,
         hours_ahead: u32,
     ) -> CapacityForecast {
-        let current_util = 65.0;
-        let growth_rate_per_hour = 0.5; // 0.5% per hour
-        let projected = (current_util + growth_rate_per_hour * hours_ahead as f64).min(100.0);
-
-        let hours_to_90 = if current_util < 90.0 {
-            Some(((90.0 - current_util) / growth_rate_per_hour) as u32)
-        } else {
-            Some(0)
-        };
-
-        let hours_to_full = if current_util < 100.0 {
-            Some(((100.0 - current_util) / growth_rate_per_hour) as u32)
-        } else {
-            Some(0)
-        };
-
-        let recommendation = if projected > 90.0 {
-            "Consider adding GPU nodes or migrating workloads to NC2 clusters".to_string()
-        } else if projected > 75.0 {
-            "Monitor closely; plan for capacity expansion within the forecast window".to_string()
-        } else {
-            "Capacity is sufficient for the forecast period".to_string()
-        };
+        let metrics = self.local_metrics(cluster_id);
+        let current_util = metrics
+            .first()
+            .map(|m| m.utilization_percent)
+            .unwrap_or(0.0);
+        let growth_rate = 0.5; // 0.5% per hour assumption
+        let projected =
+            (current_util + growth_rate * hours_ahead as f64).min(100.0);
 
         CapacityForecast {
             cluster_id: cluster_id.to_string(),
             current_utilization_percent: current_util,
             projected_utilization_percent: projected,
-            hours_until_90_percent: hours_to_90,
-            hours_until_full: hours_to_full,
-            recommendation,
+            hours_until_90_percent: if current_util < 90.0 {
+                Some(((90.0 - current_util) / growth_rate) as u32)
+            } else {
+                Some(0)
+            },
+            hours_until_full: if current_util < 100.0 {
+                Some(((100.0 - current_util) / growth_rate) as u32)
+            } else {
+                Some(0)
+            },
+            recommendation: if projected > 90.0 {
+                "Consider adding GPU nodes".to_string()
+            } else if projected > 75.0 {
+                "Monitor closely".to_string()
+            } else {
+                "Capacity sufficient".to_string()
+            },
         }
     }
 }
@@ -510,62 +538,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_metrics() {
+    async fn test_local_collect_metrics() {
         let monitor = make_monitor();
         let metrics = monitor.collect_metrics("node-001").await.unwrap();
-        assert_eq!(metrics.len(), 2);
-        assert!(metrics[0].utilization_percent > 0.0);
-        assert!(metrics[0].memory_total_bytes > 0);
+        // On systems without GPUs this will be empty -- that is correct.
+        // On GPU systems each metric should have sensible values.
+        for m in &metrics {
+            assert!(m.utilization_percent >= 0.0 && m.utilization_percent <= 100.0);
+            assert!(m.memory_total_bytes >= m.memory_used_bytes);
+        }
     }
 
     #[tokio::test]
-    async fn test_check_health_healthy_node() {
+    async fn test_local_check_health() {
         let monitor = make_monitor();
         let health = monitor.check_health("node-001").await.unwrap();
         assert_eq!(health.node_id, "node-001");
-        assert_eq!(health.gpu_metrics.len(), 2);
-        // Mock data has normal temps (72C, 78C) so should be healthy
-        assert_eq!(health.overall_health, HealthStatus::Healthy);
-        assert!(health.alerts.is_empty());
+        // On systems without GPUs, gpu_metrics will be empty and health is Healthy
+        // On GPU systems, health depends on actual temperature/utilization
+        if health.gpu_metrics.is_empty() {
+            assert_eq!(health.overall_health, HealthStatus::Healthy);
+            assert!(health.alerts.is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn test_get_utilization_history() {
+    async fn test_local_utilization_history() {
         let monitor = make_monitor();
         let history = monitor
             .get_utilization_history("node-001", 30)
             .await
             .unwrap();
-        assert_eq!(history.len(), 30);
-
-        // Verify timestamps are ordered
-        for i in 1..history.len() {
-            assert!(history[i].0 >= history[i - 1].0);
+        // Without GPUs this is empty; with GPUs we get one snapshot per GPU
+        for (ts, _metrics) in &history {
+            assert!(*ts > 0);
         }
     }
 
     #[tokio::test]
-    async fn test_predict_capacity() {
+    async fn test_local_predict_capacity() {
         let monitor = make_monitor();
         let forecast = monitor
             .predict_capacity("cluster-001", 48)
             .await
             .unwrap();
         assert_eq!(forecast.cluster_id, "cluster-001");
-        assert!(forecast.projected_utilization_percent > forecast.current_utilization_percent);
+        // Projected should always be >= current (growth rate is positive)
+        assert!(
+            forecast.projected_utilization_percent
+                >= forecast.current_utilization_percent
+        );
         assert!(forecast.hours_until_90_percent.is_some());
         assert!(forecast.hours_until_full.is_some());
     }
 
     #[tokio::test]
-    async fn test_predict_capacity_long_horizon() {
+    async fn test_local_predict_capacity_long_horizon() {
         let monitor = make_monitor();
         let forecast = monitor
-            .predict_capacity("cluster-001", 168)
+            .predict_capacity("cluster-001", 500)
             .await
             .unwrap();
-        // With 0.5% per hour growth from 65%, after 168 hours = 65 + 84 = 149 -> capped at 100
-        assert!((forecast.projected_utilization_percent - 100.0).abs() < 0.01);
+        // With 0.5%/hr growth over 500 hours, projected should cap at 100
+        assert!(forecast.projected_utilization_percent <= 100.0);
     }
 
     #[test]

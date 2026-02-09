@@ -66,6 +66,37 @@ pub enum GpuModel {
     Other(String),
 }
 
+impl GpuModel {
+    /// Parse a GPU model from a device name string.
+    ///
+    /// Matches known model identifiers (case-insensitive) and returns the
+    /// corresponding enum variant, or `GpuModel::Other` if unrecognized.
+    pub fn from_name(name: &str) -> Self {
+        let upper = name.to_uppercase();
+        if upper.contains("A100") {
+            GpuModel::NvidiaA100
+        } else if upper.contains("H100") {
+            GpuModel::NvidiaH100
+        } else if upper.contains("L40") {
+            GpuModel::NvidiaL40S
+        } else if upper.contains("T4") && !upper.contains("RTX") {
+            GpuModel::NvidiaT4
+        } else if upper.contains("V100") {
+            GpuModel::NvidiaV100
+        } else if upper.contains("MI250") {
+            GpuModel::AmdMI250X
+        } else if upper.contains("MI300") {
+            GpuModel::AmdMI300X
+        } else if upper.contains("MI210") {
+            GpuModel::AmdMI210
+        } else if upper.contains("MAX") && upper.contains("1550") {
+            GpuModel::IntelMax1550
+        } else {
+            GpuModel::Other(name.to_string())
+        }
+    }
+}
+
 impl std::fmt::Display for GpuModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

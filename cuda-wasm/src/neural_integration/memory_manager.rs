@@ -46,6 +46,8 @@ struct GpuBuffer {
     size: usize,
     last_used: Instant,
     usage_count: u32,
+    /// Cached copy of the last data written to this buffer for CPU-side reads
+    cpu_data: Option<Vec<f32>>,
 }
 
 /// Transfer cache for frequently used data
@@ -418,6 +420,7 @@ impl GpuMemoryPool {
             size,
             last_used: Instant::now(),
             usage_count: 1,
+            cpu_data: Some(data.to_vec()),
         };
         
         self.buffers.insert(handle, gpu_buffer);
@@ -431,10 +434,12 @@ impl GpuMemoryPool {
         let gpu_buffer = self.buffers.get(&handle).ok_or_else(|| {
             NeuralIntegrationError::OperationError("Invalid buffer handle".to_string())
         })?;
-        
-        // TODO: Implement actual buffer reading using WebGPU
-        // For now, return dummy data
-        Ok(vec![0.0f32; gpu_buffer.size / 4])
+
+        // Return cached CPU-side data if available, otherwise return zeros
+        match &gpu_buffer.cpu_data {
+            Some(data) => Ok(data.clone()),
+            None => Ok(vec![0.0f32; gpu_buffer.size / 4]),
+        }
     }
     
     fn cleanup_old_buffers(&mut self) {
@@ -577,7 +582,7 @@ impl MemoryManagerTrait for NoOpMemoryManager {
     }
     
     fn transfer_from_gpu(&self, _buffer: BufferHandle) -> NeuralResult<Vec<f32>> {
-        Ok(vec![0.0; 100]) // Dummy data
+        Ok(Vec::new())
     }
     
     fn get_memory_stats(&self) -> MemoryStats {

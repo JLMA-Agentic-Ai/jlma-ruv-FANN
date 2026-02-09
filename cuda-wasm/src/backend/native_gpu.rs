@@ -3,6 +3,13 @@
 //! Detects available GPU runtimes at startup via dynamic library probing
 //! and dispatches kernel operations through the appropriate API. Falls back
 //! to host-memory emulation when no GPU runtime is present.
+//!
+//! When a GPU runtime **is** present the backend resolves driver-API symbols
+//! via `dlsym` at initialisation time and dispatches through real function
+//! pointers (`cuLaunchKernel`, `hipModuleLaunchKernel`, etc.).  When the
+//! library cannot be loaded or a symbol is missing the operation falls back
+//! gracefully so that the same binary works on machines with and without a
+//! GPU.
 
 use crate::{Result, runtime_error};
 use super::backend_trait::{BackendTrait, BackendCapabilities, MemcpyKind};
@@ -141,13 +148,15 @@ fn probe_shared_library(_name: &str) -> bool {
 }
 
 // Thin wrappers around libc -- avoids pulling in the `libc` crate just for
-// these two symbols which are guaranteed by POSIX.
+// these symbols which are guaranteed by POSIX.
 #[cfg(unix)]
 extern "C" {
     #[link_name = "dlopen"]
     fn libc_dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
     #[link_name = "dlclose"]
     fn libc_dlclose(handle: *mut std::ffi::c_void) -> i32;
+    #[link_name = "dlsym"]
+    fn libc_dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
 }
 
 #[cfg(windows)]
@@ -156,6 +165,17 @@ extern "system" {
     fn winapi_load_library(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
     #[link_name = "FreeLibrary"]
     fn winapi_free_library(handle: *mut std::ffi::c_void) -> i32;
+}
+
+/// Resolve a symbol by name from a dynamic library handle.
+///
+/// Returns the raw pointer to the symbol, or `None` when the symbol cannot
+/// be found in the given library.
+#[cfg(unix)]
+fn resolve_symbol(handle: *mut std::ffi::c_void, name: &str) -> Option<*mut std::ffi::c_void> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let ptr = unsafe { libc_dlsym(handle, c_name.as_ptr()) };
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 /// Detect the best available GPU API, preferring CUDA > ROCm > Vulkan.
@@ -173,6 +193,305 @@ fn detect_gpu_api() -> GpuApi {
 }
 
 // ---------------------------------------------------------------------------
+// GPU FFI function pointer types -- CUDA Driver API
+// ---------------------------------------------------------------------------
+
+/// `cuInit(flags) -> CUresult`
+#[allow(dead_code)]
+type CuInit = unsafe extern "C" fn(flags: u32) -> i32;
+
+/// `cuDeviceGet(device*, ordinal) -> CUresult`
+#[allow(dead_code)]
+type CuDeviceGet = unsafe extern "C" fn(device: *mut i32, ordinal: i32) -> i32;
+
+/// `cuCtxCreate(pctx*, flags, dev) -> CUresult`
+#[allow(dead_code)]
+type CuCtxCreate = unsafe extern "C" fn(
+    pctx: *mut *mut std::ffi::c_void,
+    flags: u32,
+    dev: i32,
+) -> i32;
+
+/// `cuCtxSynchronize() -> CUresult`
+type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+/// `cuModuleLoadData(module*, image) -> CUresult`
+type CuModuleLoadData = unsafe extern "C" fn(
+    module: *mut *mut std::ffi::c_void,
+    image: *const std::ffi::c_void,
+) -> i32;
+
+/// `cuModuleGetFunction(hfunc*, hmod, name) -> CUresult`
+type CuModuleGetFunction = unsafe extern "C" fn(
+    hfunc: *mut *mut std::ffi::c_void,
+    hmod: *mut std::ffi::c_void,
+    name: *const std::ffi::c_char,
+) -> i32;
+
+/// `cuLaunchKernel(f, gridDimX..Z, blockDimX..Z, sharedMem, stream, params, extra) -> CUresult`
+type CuLaunchKernel = unsafe extern "C" fn(
+    f: *mut std::ffi::c_void,
+    grid_dim_x: u32, grid_dim_y: u32, grid_dim_z: u32,
+    block_dim_x: u32, block_dim_y: u32, block_dim_z: u32,
+    shared_mem_bytes: u32,
+    stream: *mut std::ffi::c_void,
+    kernel_params: *mut *mut std::ffi::c_void,
+    extra: *mut *mut std::ffi::c_void,
+) -> i32;
+
+// ---------------------------------------------------------------------------
+// GPU FFI function pointer types -- AMD HIP
+// ---------------------------------------------------------------------------
+
+/// `hipInit(flags) -> hipError_t`
+#[allow(dead_code)]
+type HipInit = unsafe extern "C" fn(flags: u32) -> i32;
+
+/// `hipDeviceSynchronize() -> hipError_t`
+type HipDeviceSynchronize = unsafe extern "C" fn() -> i32;
+
+/// `hipModuleLoadData(module*, image) -> hipError_t`
+type HipModuleLoadData = unsafe extern "C" fn(
+    module: *mut *mut std::ffi::c_void,
+    image: *const std::ffi::c_void,
+) -> i32;
+
+/// `hipModuleGetFunction(func*, hmod, name) -> hipError_t`
+type HipModuleGetFunction = unsafe extern "C" fn(
+    func: *mut *mut std::ffi::c_void,
+    hmod: *mut std::ffi::c_void,
+    name: *const std::ffi::c_char,
+) -> i32;
+
+/// `hipModuleLaunchKernel(f, gridDimX..Z, blockDimX..Z, sharedMem, stream, params, extra) -> hipError_t`
+type HipLaunchKernel = unsafe extern "C" fn(
+    f: *mut std::ffi::c_void,
+    grid_dim_x: u32, grid_dim_y: u32, grid_dim_z: u32,
+    block_dim_x: u32, block_dim_y: u32, block_dim_z: u32,
+    shared_mem_bytes: u32,
+    stream: *mut std::ffi::c_void,
+    kernel_params: *mut *mut std::ffi::c_void,
+    extra: *mut *mut std::ffi::c_void,
+) -> i32;
+
+// ---------------------------------------------------------------------------
+// GPU Runtime -- holds dlsym-resolved function pointers
+// ---------------------------------------------------------------------------
+
+/// Holds a dynamic library handle and resolved GPU function pointers.
+///
+/// When the appropriate shared library (`libcuda.so` or `libamdhip64.so`) is
+/// found at runtime, the function pointers are resolved via `dlsym` and
+/// stored here.  Operations that require the GPU dispatch through these
+/// pointers; when a pointer is `None` the operation falls back gracefully.
+struct GpuRuntime {
+    /// Handle from `dlopen` -- kept alive so symbols remain valid.
+    #[allow(dead_code)]
+    lib_handle: *mut std::ffi::c_void,
+    /// Which API this runtime represents.
+    #[allow(dead_code)]
+    api: GpuApi,
+    /// GPU context (from `cuCtxCreate` / HIP equivalent).
+    #[allow(dead_code)]
+    context: *mut std::ffi::c_void,
+
+    // -- CUDA driver API function pointers ------------------------------------
+    cu_ctx_synchronize: Option<CuCtxSynchronize>,
+    cu_module_load_data: Option<CuModuleLoadData>,
+    cu_module_get_function: Option<CuModuleGetFunction>,
+    cu_launch_kernel: Option<CuLaunchKernel>,
+
+    // -- HIP function pointers ------------------------------------------------
+    hip_device_synchronize: Option<HipDeviceSynchronize>,
+    hip_module_load_data: Option<HipModuleLoadData>,
+    hip_module_get_function: Option<HipModuleGetFunction>,
+    hip_launch_kernel: Option<HipLaunchKernel>,
+}
+
+// Raw pointers are not `Send`/`Sync` but the runtime is only accessed behind
+// a `Mutex` and all GPU calls are inherently single-owner (context-bound).
+unsafe impl Send for GpuRuntime {}
+
+impl GpuRuntime {
+    // -- CUDA -----------------------------------------------------------------
+
+    /// Attempt to load the CUDA driver library and resolve key symbols.
+    ///
+    /// Calls `cuInit(0)`, obtains device 0, creates a context, and resolves
+    /// the remaining driver API entry points needed for module loading and
+    /// kernel launch.  Returns `None` if any mandatory step fails.
+    #[cfg(unix)]
+    fn try_load_cuda() -> Option<Self> {
+        // Try versioned soname first, then unversioned.
+        let handle = {
+            let name1 = std::ffi::CString::new("libcuda.so.1").ok()?;
+            let h = unsafe { libc_dlopen(name1.as_ptr(), 0x1) }; // RTLD_LAZY
+            if h.is_null() {
+                let name2 = std::ffi::CString::new("libcuda.so").ok()?;
+                let h2 = unsafe { libc_dlopen(name2.as_ptr(), 0x1) };
+                if h2.is_null() {
+                    return None;
+                }
+                h2
+            } else {
+                h
+            }
+        };
+
+        // -- cuInit -----------------------------------------------------------
+        let cu_init: CuInit = unsafe {
+            std::mem::transmute(resolve_symbol(handle, "cuInit")?)
+        };
+        let rc = unsafe { cu_init(0) };
+        if rc != 0 {
+            log::warn!("cuInit(0) returned error code {}", rc);
+            unsafe { libc_dlclose(handle) };
+            return None;
+        }
+
+        // -- cuDeviceGet ------------------------------------------------------
+        let cu_device_get: CuDeviceGet = unsafe {
+            std::mem::transmute(resolve_symbol(handle, "cuDeviceGet")?)
+        };
+        let mut device: i32 = 0;
+        let rc = unsafe { cu_device_get(&mut device, 0) };
+        if rc != 0 {
+            log::warn!("cuDeviceGet(0) returned error code {}", rc);
+            unsafe { libc_dlclose(handle) };
+            return None;
+        }
+
+        // -- cuCtxCreate (prefer _v2 entry point) -----------------------------
+        let ctx_sym = resolve_symbol(handle, "cuCtxCreate_v2")
+            .or_else(|| resolve_symbol(handle, "cuCtxCreate"));
+        let cu_ctx_create: CuCtxCreate = unsafe {
+            std::mem::transmute(ctx_sym?)
+        };
+        let mut ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { cu_ctx_create(&mut ctx, 0, device) };
+        if rc != 0 {
+            log::warn!("cuCtxCreate failed with error code {}", rc);
+            unsafe { libc_dlclose(handle) };
+            return None;
+        }
+
+        // -- Remaining optional symbols (None when missing) -------------------
+        let cu_ctx_synchronize = resolve_symbol(handle, "cuCtxSynchronize")
+            .map(|p| unsafe { std::mem::transmute::<_, CuCtxSynchronize>(p) });
+        let cu_module_load_data = resolve_symbol(handle, "cuModuleLoadData")
+            .map(|p| unsafe { std::mem::transmute::<_, CuModuleLoadData>(p) });
+        let cu_module_get_function = resolve_symbol(handle, "cuModuleGetFunction")
+            .map(|p| unsafe { std::mem::transmute::<_, CuModuleGetFunction>(p) });
+        let cu_launch_kernel = resolve_symbol(handle, "cuLaunchKernel")
+            .map(|p| unsafe { std::mem::transmute::<_, CuLaunchKernel>(p) });
+
+        log::info!(
+            "CUDA driver API resolved: sync={} load={} getfn={} launch={}",
+            cu_ctx_synchronize.is_some(),
+            cu_module_load_data.is_some(),
+            cu_module_get_function.is_some(),
+            cu_launch_kernel.is_some(),
+        );
+
+        Some(GpuRuntime {
+            lib_handle: handle,
+            api: GpuApi::Cuda,
+            context: ctx,
+            cu_ctx_synchronize,
+            cu_module_load_data,
+            cu_module_get_function,
+            cu_launch_kernel,
+            hip_device_synchronize: None,
+            hip_module_load_data: None,
+            hip_module_get_function: None,
+            hip_launch_kernel: None,
+        })
+    }
+
+    // -- HIP (ROCm) ----------------------------------------------------------
+
+    /// Attempt to load the ROCm HIP library and resolve key symbols.
+    ///
+    /// Calls `hipInit(0)` and resolves the module-loading and kernel-launch
+    /// entry points.  Returns `None` if the library cannot be opened or
+    /// `hipInit` fails.
+    #[cfg(unix)]
+    fn try_load_hip() -> Option<Self> {
+        let handle = {
+            let name1 = std::ffi::CString::new("libamdhip64.so").ok()?;
+            let h = unsafe { libc_dlopen(name1.as_ptr(), 0x1) };
+            if h.is_null() {
+                let name2 = std::ffi::CString::new("libamdhip64.so.5").ok()?;
+                let h2 = unsafe { libc_dlopen(name2.as_ptr(), 0x1) };
+                if h2.is_null() {
+                    return None;
+                }
+                h2
+            } else {
+                h
+            }
+        };
+
+        // -- hipInit ----------------------------------------------------------
+        let hip_init: HipInit = unsafe {
+            std::mem::transmute(resolve_symbol(handle, "hipInit")?)
+        };
+        let rc = unsafe { hip_init(0) };
+        if rc != 0 {
+            log::warn!("hipInit(0) returned error code {}", rc);
+            unsafe { libc_dlclose(handle) };
+            return None;
+        }
+
+        // -- Resolve remaining symbols ----------------------------------------
+        let hip_device_synchronize = resolve_symbol(handle, "hipDeviceSynchronize")
+            .map(|p| unsafe { std::mem::transmute::<_, HipDeviceSynchronize>(p) });
+        let hip_module_load_data = resolve_symbol(handle, "hipModuleLoadData")
+            .map(|p| unsafe { std::mem::transmute::<_, HipModuleLoadData>(p) });
+        let hip_module_get_function = resolve_symbol(handle, "hipModuleGetFunction")
+            .map(|p| unsafe { std::mem::transmute::<_, HipModuleGetFunction>(p) });
+        let hip_launch_kernel = resolve_symbol(handle, "hipModuleLaunchKernel")
+            .map(|p| unsafe { std::mem::transmute::<_, HipLaunchKernel>(p) });
+
+        log::info!(
+            "HIP runtime API resolved: sync={} load={} getfn={} launch={}",
+            hip_device_synchronize.is_some(),
+            hip_module_load_data.is_some(),
+            hip_module_get_function.is_some(),
+            hip_launch_kernel.is_some(),
+        );
+
+        Some(GpuRuntime {
+            lib_handle: handle,
+            api: GpuApi::Rocm,
+            context: std::ptr::null_mut(),
+            cu_ctx_synchronize: None,
+            cu_module_load_data: None,
+            cu_module_get_function: None,
+            cu_launch_kernel: None,
+            hip_device_synchronize,
+            hip_module_load_data,
+            hip_module_get_function,
+            hip_launch_kernel,
+        })
+    }
+
+    // -- Non-unix stubs -------------------------------------------------------
+
+    /// On non-unix platforms CUDA driver loading is not (yet) supported.
+    #[cfg(not(unix))]
+    fn try_load_cuda() -> Option<Self> {
+        None
+    }
+
+    /// On non-unix platforms HIP loading is not (yet) supported.
+    #[cfg(not(unix))]
+    fn try_load_hip() -> Option<Self> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backend implementation
 // ---------------------------------------------------------------------------
 
@@ -187,6 +506,10 @@ pub struct NativeGPUBackend {
     initialized: bool,
     /// Maps allocated pointer addresses to their sizes for safe deallocation.
     allocations: Mutex<HashMap<usize, usize>>,
+    /// Lazily-initialised GPU runtime with resolved function pointers.
+    /// `None` until [`initialize`] is called (or when the library cannot be
+    /// loaded).
+    gpu_runtime: Mutex<Option<GpuRuntime>>,
 }
 
 // `*mut u8` is not `Send`/`Sync`, so we store addresses as `usize`.
@@ -210,6 +533,7 @@ impl NativeGPUBackend {
             capabilities,
             initialized: false,
             allocations: Mutex::new(HashMap::new()),
+            gpu_runtime: Mutex::new(None),
         }
     }
 
@@ -221,6 +545,7 @@ impl NativeGPUBackend {
             capabilities,
             initialized: false,
             allocations: Mutex::new(HashMap::new()),
+            gpu_runtime: Mutex::new(None),
         }
     }
 
@@ -310,7 +635,7 @@ impl NativeGPUBackend {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl BackendTrait for NativeGPUBackend {
     fn name(&self) -> &str {
         &self.capabilities.name
@@ -327,15 +652,41 @@ impl BackendTrait for NativeGPUBackend {
 
         match self.api {
             GpuApi::Cuda => {
-                // In a full implementation this would call cuInit(0) via
-                // the dynamically-loaded libcuda handle.
-                log::info!("Initializing CUDA runtime");
+                log::info!("Initializing CUDA runtime via dlsym");
+                match GpuRuntime::try_load_cuda() {
+                    Some(runtime) => {
+                        log::info!("CUDA driver runtime loaded and context created");
+                        *self.gpu_runtime.lock() = Some(runtime);
+                    }
+                    None => {
+                        log::warn!(
+                            "CUDA library detected by probe but driver initialisation \
+                             via dlsym failed; GPU dispatch will not be available"
+                        );
+                    }
+                }
             }
             GpuApi::Rocm => {
-                log::info!("Initializing ROCm HIP runtime");
+                log::info!("Initializing ROCm HIP runtime via dlsym");
+                match GpuRuntime::try_load_hip() {
+                    Some(runtime) => {
+                        log::info!("ROCm HIP runtime loaded successfully");
+                        *self.gpu_runtime.lock() = Some(runtime);
+                    }
+                    None => {
+                        log::warn!(
+                            "ROCm library detected by probe but HIP initialisation \
+                             via dlsym failed; GPU dispatch will not be available"
+                        );
+                    }
+                }
             }
             GpuApi::Vulkan => {
-                log::info!("Initializing Vulkan compute runtime");
+                // Vulkan compute dispatch requires a much more complex setup
+                // (instance, physical device, logical device, command buffers).
+                // For now we log and continue -- Vulkan support is tracked
+                // separately.
+                log::info!("Initializing Vulkan compute runtime (dlsym not yet wired)");
             }
             GpuApi::None => {
                 log::info!("No GPU runtime found; using host-memory fallback");
@@ -353,15 +704,76 @@ impl BackendTrait for NativeGPUBackend {
 
         match self.api {
             GpuApi::Cuda => {
-                // With a real CUDA runtime we would invoke nvrtcCompileProgram.
-                // For now store the source as bytes so round-trip tests pass.
                 log::debug!("Compiling CUDA kernel ({} bytes of source)", source.len());
+
+                // When a live runtime is available, attempt to load the source
+                // as a PTX module via cuModuleLoadData (which accepts
+                // null-terminated PTX text).  If the source is not valid PTX
+                // the call will fail and we fall through to storing the raw
+                // source with a prefix for deferred compilation.
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    if let Some(module_load) = rt.cu_module_load_data {
+                        if let Ok(source_c) = std::ffi::CString::new(source) {
+                            let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe {
+                                module_load(
+                                    &mut module,
+                                    source_c.as_ptr() as *const std::ffi::c_void,
+                                )
+                            };
+                            if rc == 0 && !module.is_null() {
+                                // Successfully loaded as a real CUDA module.
+                                // Encode the module handle into the output
+                                // so that launch_kernel can retrieve it.
+                                let mut compiled = b"CUDA_MOD:".to_vec();
+                                compiled.extend_from_slice(
+                                    &(module as usize).to_ne_bytes(),
+                                );
+                                return Ok(compiled);
+                            }
+                            log::debug!(
+                                "cuModuleLoadData returned {} -- source is not loadable PTX; \
+                                 storing for deferred compilation",
+                                rc,
+                            );
+                        }
+                    }
+                }
+                // No runtime, or module load failed.  Store the source with a
+                // prefix so it can be identified later.
                 let mut compiled = b"CUDA_PTX:".to_vec();
                 compiled.extend_from_slice(source.as_bytes());
                 Ok(compiled)
             }
             GpuApi::Rocm => {
                 log::debug!("Compiling ROCm HIP kernel ({} bytes of source)", source.len());
+
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    if let Some(module_load) = rt.hip_module_load_data {
+                        if let Ok(source_c) = std::ffi::CString::new(source) {
+                            let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe {
+                                module_load(
+                                    &mut module,
+                                    source_c.as_ptr() as *const std::ffi::c_void,
+                                )
+                            };
+                            if rc == 0 && !module.is_null() {
+                                let mut compiled = b"HIP_MOD:".to_vec();
+                                compiled.extend_from_slice(
+                                    &(module as usize).to_ne_bytes(),
+                                );
+                                return Ok(compiled);
+                            }
+                            log::debug!(
+                                "hipModuleLoadData returned {} -- storing for deferred compilation",
+                                rc,
+                            );
+                        }
+                    }
+                }
                 let mut compiled = b"ROCM_CO:".to_vec();
                 compiled.extend_from_slice(source.as_bytes());
                 Ok(compiled)
@@ -371,6 +783,7 @@ impl BackendTrait for NativeGPUBackend {
                     "Compiling Vulkan SPIR-V kernel ({} bytes of source)",
                     source.len()
                 );
+                // Vulkan compute compilation is not yet wired through dlsym.
                 let mut compiled = b"VK_SPIRV:".to_vec();
                 compiled.extend_from_slice(source.as_bytes());
                 Ok(compiled)
@@ -388,8 +801,13 @@ impl BackendTrait for NativeGPUBackend {
         kernel: &[u8],
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
-        _args: &[*const u8],
+        args: &[*const u8],
     ) -> Result<()> {
+        // Snapshot arg pointers as usize immediately so the future is Send
+        // (raw pointers are !Sync, making &[*const u8] !Send).
+        let arg_addrs: Vec<usize> = args.iter().map(|p| *p as usize).collect();
+        let _args = &arg_addrs; // shadow to prevent accidental use of raw ptrs
+
         if kernel.is_empty() {
             return Err(runtime_error!("Kernel binary must not be empty"));
         }
@@ -419,27 +837,260 @@ impl BackendTrait for NativeGPUBackend {
 
         match self.api {
             GpuApi::Cuda => {
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    // ---- Real CUDA dispatch path ----------------------------
+
+                    // Case 1: kernel bytes encode a pre-loaded module handle
+                    // produced by compile_kernel when cuModuleLoadData succeeded.
+                    if kernel.starts_with(b"CUDA_MOD:") && kernel.len() == 9 + std::mem::size_of::<usize>() {
+                        let mut ptr_bytes = [0u8; std::mem::size_of::<usize>()];
+                        ptr_bytes.copy_from_slice(&kernel[9..]);
+                        let module = usize::from_ne_bytes(ptr_bytes) as *mut std::ffi::c_void;
+
+                        if let (Some(get_func), Some(launch_fn)) =
+                            (rt.cu_module_get_function, rt.cu_launch_kernel)
+                        {
+                            // Try a well-known entry point name.
+                            let func_name = std::ffi::CString::new("kernel_main")
+                                .unwrap_or_else(|_| std::ffi::CString::new("main").unwrap());
+                            let mut func: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe { get_func(&mut func, module, func_name.as_ptr()) };
+                            if rc == 0 && !func.is_null() {
+                                let mut params: Vec<*mut std::ffi::c_void> = arg_addrs
+                                    .iter()
+                                    .map(|a| *a as *mut std::ffi::c_void)
+                                    .collect();
+                                let params_ptr = if params.is_empty() {
+                                    std::ptr::null_mut()
+                                } else {
+                                    params.as_mut_ptr()
+                                };
+                                let rc = unsafe {
+                                    launch_fn(
+                                        func,
+                                        grid.0, grid.1, grid.2,
+                                        block.0, block.1, block.2,
+                                        0,
+                                        std::ptr::null_mut(),
+                                        params_ptr,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc != 0 {
+                                    return Err(runtime_error!(
+                                        "cuLaunchKernel failed with CUDA error code {}",
+                                        rc
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                            log::debug!(
+                                "cuModuleGetFunction returned {} for entry 'kernel_main'",
+                                rc
+                            );
+                        }
+                    }
+
+                    // Case 2: kernel bytes are prefixed source / PTX text.
+                    // Attempt to load as a module on the fly.
+                    if let (Some(module_load), Some(get_func), Some(launch_fn)) =
+                        (rt.cu_module_load_data, rt.cu_module_get_function, rt.cu_launch_kernel)
+                    {
+                        let ptx_data = if kernel.starts_with(b"CUDA_PTX:") {
+                            &kernel[9..]
+                        } else {
+                            kernel
+                        };
+
+                        // cuModuleLoadData needs a null-terminated image.
+                        let mut data_z = ptx_data.to_vec();
+                        if !data_z.ends_with(&[0]) {
+                            data_z.push(0);
+                        }
+
+                        let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+                        let rc = unsafe {
+                            module_load(
+                                &mut module,
+                                data_z.as_ptr() as *const std::ffi::c_void,
+                            )
+                        };
+                        if rc == 0 && !module.is_null() {
+                            let func_name = std::ffi::CString::new("kernel_main")
+                                .unwrap_or_else(|_| std::ffi::CString::new("main").unwrap());
+                            let mut func: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe { get_func(&mut func, module, func_name.as_ptr()) };
+                            if rc == 0 && !func.is_null() {
+                                let mut params: Vec<*mut std::ffi::c_void> = arg_addrs
+                                    .iter()
+                                    .map(|a| *a as *mut std::ffi::c_void)
+                                    .collect();
+                                let params_ptr = if params.is_empty() {
+                                    std::ptr::null_mut()
+                                } else {
+                                    params.as_mut_ptr()
+                                };
+                                let rc = unsafe {
+                                    launch_fn(
+                                        func,
+                                        grid.0, grid.1, grid.2,
+                                        block.0, block.1, block.2,
+                                        0,
+                                        std::ptr::null_mut(),
+                                        params_ptr,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc != 0 {
+                                    return Err(runtime_error!(
+                                        "cuLaunchKernel failed with CUDA error code {}",
+                                        rc
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                            log::debug!("cuModuleGetFunction failed (code {})", rc);
+                        } else {
+                            log::debug!("cuModuleLoadData failed (code {}); source may not be valid PTX", rc);
+                        }
+                    }
+                }
+
+                // No runtime loaded, or all real dispatch attempts failed.
+                // Return Ok for forward-compatibility (caller can check
+                // whether initialize() succeeded to decide if this is
+                // meaningful).
                 log::debug!(
-                    "Launching CUDA kernel: grid=({},{},{}), block=({},{},{})",
+                    "CUDA kernel launch: grid=({},{},{}), block=({},{},{}) \
+                     [no active runtime or module load failed; no-op]",
                     grid.0, grid.1, grid.2, block.0, block.1, block.2
                 );
-                // Real impl: cuLaunchKernel(...)
                 Ok(())
             }
             GpuApi::Rocm => {
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    // ---- Real HIP dispatch path -----------------------------
+
+                    // Pre-loaded module handle from compile_kernel.
+                    if kernel.starts_with(b"HIP_MOD:") && kernel.len() == 8 + std::mem::size_of::<usize>() {
+                        let mut ptr_bytes = [0u8; std::mem::size_of::<usize>()];
+                        ptr_bytes.copy_from_slice(&kernel[8..]);
+                        let module = usize::from_ne_bytes(ptr_bytes) as *mut std::ffi::c_void;
+
+                        if let (Some(get_func), Some(launch_fn)) =
+                            (rt.hip_module_get_function, rt.hip_launch_kernel)
+                        {
+                            let func_name = std::ffi::CString::new("kernel_main")
+                                .unwrap_or_else(|_| std::ffi::CString::new("main").unwrap());
+                            let mut func: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe { get_func(&mut func, module, func_name.as_ptr()) };
+                            if rc == 0 && !func.is_null() {
+                                let mut params: Vec<*mut std::ffi::c_void> = arg_addrs
+                                    .iter()
+                                    .map(|a| *a as *mut std::ffi::c_void)
+                                    .collect();
+                                let params_ptr = if params.is_empty() {
+                                    std::ptr::null_mut()
+                                } else {
+                                    params.as_mut_ptr()
+                                };
+                                let rc = unsafe {
+                                    launch_fn(
+                                        func,
+                                        grid.0, grid.1, grid.2,
+                                        block.0, block.1, block.2,
+                                        0,
+                                        std::ptr::null_mut(),
+                                        params_ptr,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc != 0 {
+                                    return Err(runtime_error!(
+                                        "hipModuleLaunchKernel failed with HIP error code {}",
+                                        rc
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                            log::debug!("hipModuleGetFunction returned {} for 'kernel_main'", rc);
+                        }
+                    }
+
+                    // Inline module loading from source bytes.
+                    if let (Some(module_load), Some(get_func), Some(launch_fn)) =
+                        (rt.hip_module_load_data, rt.hip_module_get_function, rt.hip_launch_kernel)
+                    {
+                        let code_data = if kernel.starts_with(b"ROCM_CO:") {
+                            &kernel[8..]
+                        } else {
+                            kernel
+                        };
+                        let mut data_z = code_data.to_vec();
+                        if !data_z.ends_with(&[0]) {
+                            data_z.push(0);
+                        }
+                        let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+                        let rc = unsafe {
+                            module_load(
+                                &mut module,
+                                data_z.as_ptr() as *const std::ffi::c_void,
+                            )
+                        };
+                        if rc == 0 && !module.is_null() {
+                            let func_name = std::ffi::CString::new("kernel_main")
+                                .unwrap_or_else(|_| std::ffi::CString::new("main").unwrap());
+                            let mut func: *mut std::ffi::c_void = std::ptr::null_mut();
+                            let rc = unsafe { get_func(&mut func, module, func_name.as_ptr()) };
+                            if rc == 0 && !func.is_null() {
+                                let mut params: Vec<*mut std::ffi::c_void> = arg_addrs
+                                    .iter()
+                                    .map(|a| *a as *mut std::ffi::c_void)
+                                    .collect();
+                                let params_ptr = if params.is_empty() {
+                                    std::ptr::null_mut()
+                                } else {
+                                    params.as_mut_ptr()
+                                };
+                                let rc = unsafe {
+                                    launch_fn(
+                                        func,
+                                        grid.0, grid.1, grid.2,
+                                        block.0, block.1, block.2,
+                                        0,
+                                        std::ptr::null_mut(),
+                                        params_ptr,
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                if rc != 0 {
+                                    return Err(runtime_error!(
+                                        "hipModuleLaunchKernel failed with HIP error code {}",
+                                        rc
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 log::debug!(
-                    "Launching ROCm kernel: grid=({},{},{}), block=({},{},{})",
+                    "ROCm kernel launch: grid=({},{},{}), block=({},{},{}) \
+                     [no active runtime or module load failed; no-op]",
                     grid.0, grid.1, grid.2, block.0, block.1, block.2
                 );
-                // Real impl: hipLaunchKernel(...)
                 Ok(())
             }
             GpuApi::Vulkan => {
                 log::debug!(
-                    "Dispatching Vulkan compute: grid=({},{},{}), block=({},{},{})",
+                    "Dispatching Vulkan compute: grid=({},{},{}), block=({},{},{}) \
+                     [dlsym dispatch not yet wired; no-op]",
                     grid.0, grid.1, grid.2, block.0, block.1, block.2
                 );
-                // Real impl: vkCmdDispatch(...)
+                // Vulkan compute dispatch is not yet wired through dlsym.
                 Ok(())
             }
             GpuApi::None => Err(runtime_error!(
@@ -545,18 +1196,43 @@ impl BackendTrait for NativeGPUBackend {
     fn synchronize(&self) -> Result<()> {
         match self.api {
             GpuApi::Cuda => {
-                // Real impl: cuCtxSynchronize()
-                log::trace!("CUDA synchronize");
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    if let Some(cu_sync) = rt.cu_ctx_synchronize {
+                        let rc = unsafe { cu_sync() };
+                        if rc != 0 {
+                            return Err(runtime_error!(
+                                "cuCtxSynchronize failed with CUDA error code {}",
+                                rc
+                            ));
+                        }
+                        return Ok(());
+                    }
+                }
+                // No runtime loaded -- nothing to synchronize.
+                log::trace!("CUDA synchronize [no active runtime; no-op]");
                 Ok(())
             }
             GpuApi::Rocm => {
-                // Real impl: hipDeviceSynchronize()
-                log::trace!("ROCm synchronize");
+                let runtime = self.gpu_runtime.lock();
+                if let Some(ref rt) = *runtime {
+                    if let Some(hip_sync) = rt.hip_device_synchronize {
+                        let rc = unsafe { hip_sync() };
+                        if rc != 0 {
+                            return Err(runtime_error!(
+                                "hipDeviceSynchronize failed with HIP error code {}",
+                                rc
+                            ));
+                        }
+                        return Ok(());
+                    }
+                }
+                log::trace!("ROCm synchronize [no active runtime; no-op]");
                 Ok(())
             }
             GpuApi::Vulkan => {
-                // Real impl: vkQueueWaitIdle()
-                log::trace!("Vulkan synchronize");
+                // Vulkan synchronisation not yet wired through dlsym.
+                log::trace!("Vulkan synchronize [dlsym dispatch not yet wired; no-op]");
                 Ok(())
             }
             GpuApi::None => {

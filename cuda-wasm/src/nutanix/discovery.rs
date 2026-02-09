@@ -239,7 +239,8 @@ impl NutanixClient {
     /// Discover all GPU-equipped hosts across all clusters managed by Prism Central
     ///
     /// Queries the Prism Central v3 hosts/list endpoint and filters for hosts
-    /// that have GPU resources available.
+    /// that have GPU resources available. When compiled without the `nutanix`
+    /// feature, probes the local system for GPU hardware instead.
     ///
     /// # Returns
     /// A vector of `GpuNode` structs representing hosts with GPUs.
@@ -251,8 +252,7 @@ impl NutanixClient {
 
         #[cfg(not(feature = "nutanix"))]
         {
-            // Return mock data when running without the nutanix feature
-            Ok(self.mock_gpu_nodes())
+            Ok(self.local_discover_gpu_nodes())
         }
     }
 
@@ -343,7 +343,7 @@ impl NutanixClient {
 
         #[cfg(not(feature = "nutanix"))]
         {
-            Ok(self.mock_host_capabilities(host_id))
+            Ok(self.local_host_capabilities(host_id))
         }
     }
 
@@ -562,114 +562,225 @@ impl NutanixClient {
         Ok(node.capabilities)
     }
 
-    // --- Mock data for non-nutanix builds ---
+    // --- Local system probing for non-nutanix builds ---
 
+    /// Discover GPU nodes by probing the local system hardware.
+    ///
+    /// Checks for NVIDIA GPUs via `/proc/driver/nvidia` and `nvidia-smi`,
+    /// and AMD GPUs via sysfs `/sys/class/drm`. Returns an empty vector
+    /// if no GPUs are detected.
     #[cfg(not(feature = "nutanix"))]
-    fn mock_gpu_nodes(&self) -> Vec<GpuNode> {
-        let nvidia_gpu = GpuInfo {
-            vendor: GpuVendor::Nvidia,
-            model: GpuModel::NvidiaA100,
-            device_id: "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
-            memory_bytes: 80 * 1024 * 1024 * 1024, // 80 GB
-            compute_units: 108,
-            assigned: false,
-            assigned_vm: None,
-            mode: "passthrough".to_string(),
-            numa_node: Some(0),
+    fn local_discover_gpu_nodes(&self) -> Vec<GpuNode> {
+        let mut nodes = Vec::new();
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "localhost".to_string())
+            .trim()
+            .to_string();
+
+        let mut gpus = Vec::new();
+
+        // Probe NVIDIA GPUs via /proc/driver/nvidia
+        if let Ok(entries) = std::fs::read_dir("/proc/driver/nvidia/gpus") {
+            for entry in entries.flatten() {
+                if let Ok(info) =
+                    std::fs::read_to_string(entry.path().join("information"))
+                {
+                    let model_name = info
+                        .lines()
+                        .find(|l| l.contains("Model:"))
+                        .map(|l| {
+                            l.split(':')
+                                .nth(1)
+                                .unwrap_or("Unknown")
+                                .trim()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "NVIDIA GPU".to_string());
+                    let device_id =
+                        entry.file_name().to_string_lossy().to_string();
+
+                    gpus.push(GpuInfo {
+                        vendor: GpuVendor::Nvidia,
+                        model: GpuModel::from_name(&model_name),
+                        device_id,
+                        memory_bytes: 0, // Would need nvidia-smi for accurate value
+                        compute_units: 0,
+                        assigned: false,
+                        assigned_vm: None,
+                        mode: "passthrough".to_string(),
+                        numa_node: None,
+                    });
+                }
+            }
+        }
+
+        // Probe NVIDIA GPUs via nvidia-smi (fallback when /proc is absent)
+        if gpus.is_empty() {
+            if let Ok(output) = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=name,memory.total,uuid",
+                    "--format=csv,noheader,nounits",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        let parts: Vec<&str> = line.split(", ").collect();
+                        if parts.len() >= 3 {
+                            let name = parts[0].trim();
+                            let mem_mb: u64 =
+                                parts[1].trim().parse().unwrap_or(0);
+                            let uuid = parts[2].trim().to_string();
+                            gpus.push(GpuInfo {
+                                vendor: GpuVendor::Nvidia,
+                                model: GpuModel::from_name(name),
+                                device_id: uuid,
+                                memory_bytes: mem_mb * 1024 * 1024,
+                                compute_units: 0,
+                                assigned: false,
+                                assigned_vm: None,
+                                mode: "passthrough".to_string(),
+                                numa_node: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Probe AMD GPUs via sysfs
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let vendor_path = entry.path().join("device/vendor");
+                if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
+                    if vendor.trim() == "0x1002" {
+                        // AMD vendor ID
+                        let name = std::fs::read_to_string(
+                            entry.path().join("device/product_name"),
+                        )
+                        .unwrap_or_else(|_| "AMD GPU".to_string());
+                        let device_id =
+                            entry.file_name().to_string_lossy().to_string();
+                        gpus.push(GpuInfo {
+                            vendor: GpuVendor::Amd,
+                            model: GpuModel::from_name(name.trim()),
+                            device_id,
+                            memory_bytes: 0,
+                            compute_units: 0,
+                            assigned: false,
+                            assigned_vm: None,
+                            mode: "passthrough".to_string(),
+                            numa_node: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // If no real GPUs found, return empty
+        if gpus.is_empty() {
+            return nodes;
+        }
+
+        let cpu_arch = std::env::consts::ARCH.to_string();
+        let is_arm =
+            cpu_arch.contains("aarch64") || cpu_arch.contains("arm");
+        let has_nvidia =
+            gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
+        let has_amd = gpus.iter().any(|g| g.vendor == GpuVendor::Amd);
+
+        let caps = HostCapabilities {
+            host_id: "local-host".to_string(),
+            host_name: hostname.clone(),
+            cpu_arch,
+            cpu_cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
+            ram_bytes: Self::get_system_ram(),
+            has_nvidia,
+            has_amd,
+            is_arm,
+            gpus: gpus.clone(),
+            hypervisor: "bare-metal".to_string(),
+            aos_version: "N/A".to_string(),
+            gpu_passthrough_supported: true,
+            vgpu_supported: false,
+            metadata: HashMap::new(),
         };
 
-        let amd_gpu = GpuInfo {
-            vendor: GpuVendor::Amd,
-            model: GpuModel::AmdMI250X,
-            device_id: "GPU-11111111-2222-3333-4444-555555555555".to_string(),
-            memory_bytes: 128 * 1024 * 1024 * 1024, // 128 GB HBM2e
-            compute_units: 220,
-            assigned: false,
-            assigned_vm: None,
-            mode: "passthrough".to_string(),
-            numa_node: Some(0),
-        };
+        nodes.push(GpuNode {
+            host_id: "local-host".to_string(),
+            host_name: hostname,
+            cluster_id: "local".to_string(),
+            cluster_name: "Local System".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            available_gpus: gpus.clone(),
+            total_gpus: gpus,
+            capabilities: caps,
+        });
 
-        vec![
-            GpuNode {
-                host_id: "host-uuid-001".to_string(),
-                host_name: "gpu-host-nvidia-01".to_string(),
-                cluster_id: "cluster-uuid-001".to_string(),
-                cluster_name: "GPU-Cluster-01".to_string(),
-                ip_address: "10.0.1.10".to_string(),
-                available_gpus: vec![nvidia_gpu.clone(), nvidia_gpu.clone()],
-                total_gpus: vec![nvidia_gpu.clone(), nvidia_gpu.clone()],
-                capabilities: HostCapabilities {
-                    host_id: "host-uuid-001".to_string(),
-                    host_name: "gpu-host-nvidia-01".to_string(),
-                    cpu_arch: "x86_64".to_string(),
-                    cpu_cores: 64,
-                    ram_bytes: 512 * 1024 * 1024 * 1024,
-                    has_nvidia: true,
-                    has_amd: false,
-                    is_arm: false,
-                    gpus: vec![nvidia_gpu.clone(), nvidia_gpu],
-                    hypervisor: "AHV".to_string(),
-                    aos_version: "6.7.1".to_string(),
-                    gpu_passthrough_supported: true,
-                    vgpu_supported: true,
-                    metadata: HashMap::new(),
-                },
-            },
-            GpuNode {
-                host_id: "host-uuid-002".to_string(),
-                host_name: "gpu-host-amd-01".to_string(),
-                cluster_id: "cluster-uuid-001".to_string(),
-                cluster_name: "GPU-Cluster-01".to_string(),
-                ip_address: "10.0.1.11".to_string(),
-                available_gpus: vec![amd_gpu.clone()],
-                total_gpus: vec![amd_gpu.clone()],
-                capabilities: HostCapabilities {
-                    host_id: "host-uuid-002".to_string(),
-                    host_name: "gpu-host-amd-01".to_string(),
-                    cpu_arch: "x86_64".to_string(),
-                    cpu_cores: 128,
-                    ram_bytes: 1024 * 1024 * 1024 * 1024,
-                    has_nvidia: false,
-                    has_amd: true,
-                    is_arm: false,
-                    gpus: vec![amd_gpu.clone()],
-                    hypervisor: "AHV".to_string(),
-                    aos_version: "6.7.1".to_string(),
-                    gpu_passthrough_supported: true,
-                    vgpu_supported: false,
-                    metadata: HashMap::new(),
-                },
-            },
-        ]
+        nodes
     }
 
+    /// Read total system RAM from /proc/meminfo, defaulting to 16 GB.
     #[cfg(not(feature = "nutanix"))]
-    fn mock_host_capabilities(&self, host_id: &str) -> HostCapabilities {
+    fn get_system_ram() -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find(|l| l.starts_with("MemTotal"))
+                    .and_then(|l| {
+                        l.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(|kb| kb * 1024)
+                    })
+            })
+            .unwrap_or(16 * 1024 * 1024 * 1024) // 16 GB default
+    }
+
+    /// Get host capabilities by probing the local system.
+    ///
+    /// Reuses `local_discover_gpu_nodes` and returns the capabilities
+    /// of the first (local) node, or synthesizes a basic capability
+    /// set if no GPUs are detected.
+    #[cfg(not(feature = "nutanix"))]
+    fn local_host_capabilities(&self, host_id: &str) -> HostCapabilities {
+        let nodes = self.local_discover_gpu_nodes();
+        if let Some(node) = nodes.into_iter().next() {
+            // Override the host_id with the requested one
+            let mut caps = node.capabilities;
+            caps.host_id = host_id.to_string();
+            return caps;
+        }
+
+        // No GPUs found -- return basic system info
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "localhost".to_string())
+            .trim()
+            .to_string();
+        let cpu_arch = std::env::consts::ARCH.to_string();
+        let is_arm =
+            cpu_arch.contains("aarch64") || cpu_arch.contains("arm");
+
         HostCapabilities {
             host_id: host_id.to_string(),
-            host_name: format!("host-{}", &host_id[..8.min(host_id.len())]),
-            cpu_arch: "x86_64".to_string(),
-            cpu_cores: 64,
-            ram_bytes: 512 * 1024 * 1024 * 1024,
-            has_nvidia: true,
+            host_name: hostname,
+            cpu_arch,
+            cpu_cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
+            ram_bytes: Self::get_system_ram(),
+            has_nvidia: false,
             has_amd: false,
-            is_arm: false,
-            gpus: vec![GpuInfo {
-                vendor: GpuVendor::Nvidia,
-                model: GpuModel::NvidiaA100,
-                device_id: "GPU-mock-0000".to_string(),
-                memory_bytes: 80 * 1024 * 1024 * 1024,
-                compute_units: 108,
-                assigned: false,
-                assigned_vm: None,
-                mode: "passthrough".to_string(),
-                numa_node: Some(0),
-            }],
-            hypervisor: "AHV".to_string(),
-            aos_version: "6.7.1".to_string(),
-            gpu_passthrough_supported: true,
-            vgpu_supported: true,
+            is_arm,
+            gpus: Vec::new(),
+            hypervisor: "bare-metal".to_string(),
+            aos_version: "N/A".to_string(),
+            gpu_passthrough_supported: false,
+            vgpu_supported: false,
             metadata: HashMap::new(),
         }
     }
@@ -790,39 +901,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_discover_gpu_nodes() {
+    async fn test_local_discover_gpu_nodes() {
         let config = NutanixConfig::new("https://prism.example.com:9440", "test-key");
         let client = NutanixClient::new(config).unwrap();
         let nodes = client.discover_gpu_nodes().await.unwrap();
 
-        assert_eq!(nodes.len(), 2);
-        assert!(nodes[0].capabilities.has_nvidia);
-        assert!(nodes[1].capabilities.has_amd);
+        // On CI/environments without GPUs, the result may be empty -- that is correct.
+        // On GPU hosts, every node should have a non-empty host name.
+        for node in &nodes {
+            assert!(!node.host_name.is_empty());
+            assert!(!node.host_id.is_empty());
+            assert!(!node.total_gpus.is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn test_mock_cluster_summary() {
+    async fn test_local_cluster_summary() {
         let config = NutanixConfig::new("https://prism.example.com:9440", "test-key");
         let client = NutanixClient::new(config).unwrap();
         let summary = client.get_cluster_gpu_summary(None).await.unwrap();
 
-        assert!(summary.total_gpu_count > 0);
-        assert!(summary.available_gpu_count > 0);
-        assert!(summary.gpus_by_vendor.contains_key("NVIDIA"));
+        // On systems without GPUs both counts will be zero
+        assert!(summary.total_gpu_count >= summary.available_gpu_count);
+        if summary.total_gpu_count > 0 {
+            assert!(!summary.gpus_by_vendor.is_empty());
+        }
     }
 
     #[tokio::test]
-    async fn test_mock_host_capabilities() {
+    async fn test_local_host_capabilities() {
         let config = NutanixConfig::new("https://prism.example.com:9440", "test-key");
         let client = NutanixClient::new(config).unwrap();
         let caps = client
-            .get_host_capabilities("host-uuid-001")
+            .get_host_capabilities("local-host")
             .await
             .unwrap();
 
-        assert_eq!(caps.cpu_arch, "x86_64");
-        assert!(caps.has_nvidia);
-        assert!(caps.gpu_passthrough_supported);
+        // These should always be populated from real system info
+        assert!(!caps.cpu_arch.is_empty());
+        assert!(caps.cpu_cores >= 1);
+        assert!(caps.ram_bytes > 0);
+        assert_eq!(caps.host_id, "local-host");
     }
 
     #[tokio::test]
@@ -830,16 +949,14 @@ mod tests {
         let config = NutanixConfig::new("https://prism.example.com:9440", "test-key");
         let client = NutanixClient::new(config).unwrap();
 
+        // Results depend on whether real GPUs exist on the host
         let nvidia_nodes = client
             .find_best_nodes(&GpuVendor::Nvidia, 1, false)
             .await
             .unwrap();
-        assert!(!nvidia_nodes.is_empty());
-
-        let arm_nodes = client
-            .find_best_nodes(&GpuVendor::Nvidia, 1, true)
-            .await
-            .unwrap();
-        assert!(arm_nodes.is_empty()); // mock data has no ARM hosts
+        // On hosts without NVIDIA GPUs this will be empty -- that is correct
+        for node in &nvidia_nodes {
+            assert!(node.has_available_gpus(&GpuVendor::Nvidia, 1));
+        }
     }
 }
