@@ -529,8 +529,134 @@ where
             Ok(result)
         }
         
-        _ => {
-            Err(NeuralIntegrationError::OperationError(format!("CPU fallback not implemented for operation: {}", operation.name())))
+        NeuralOperation::Convolution { channels, kernel_size, stride, _phantom } => {
+            // 1D convolution per channel
+            // Input layout: [input_data (channels * input_width), kernel_weights (channels * kernel_size)]
+            let kernel_total = channels * kernel_size;
+            if inputs.len() < kernel_total {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Insufficient data for convolution".to_string(),
+                ));
+            }
+            let data_len = inputs.len() - kernel_total;
+            if channels == 0 {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Channels must be > 0".to_string(),
+                ));
+            }
+            let input_per_channel = data_len / channels;
+
+            if input_per_channel < kernel_size {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Input per channel is smaller than kernel size".to_string(),
+                ));
+            }
+
+            let output_per_channel = (input_per_channel - kernel_size) / stride + 1;
+            let mut result = Vec::with_capacity(output_per_channel * channels);
+
+            for c in 0..channels {
+                let data_start = c * input_per_channel;
+                let kernel_start = data_len + c * kernel_size;
+
+                for out_idx in 0..output_per_channel {
+                    let start = out_idx * stride;
+                    let mut sum = T::zero();
+                    for k in 0..kernel_size {
+                        sum = sum + inputs[data_start + start + k] * inputs[kernel_start + k];
+                    }
+                    result.push(sum);
+                }
+            }
+            Ok(result)
+        }
+
+        NeuralOperation::ForwardPropagation { layer_sizes, _phantom } => {
+            // Multi-layer forward propagation: weights * inputs + biases per layer
+            // Input layout: [input_data, weights_layer0, biases_layer0, weights_layer1, biases_layer1, ...]
+            if layer_sizes.len() < 2 {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Need at least 2 layer sizes for forward propagation".to_string(),
+                ));
+            }
+
+            let input_size = layer_sizes[0];
+            if inputs.len() < input_size {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Insufficient input data for forward propagation".to_string(),
+                ));
+            }
+
+            let mut current = inputs[..input_size].to_vec();
+            let mut offset = input_size;
+
+            for layer_idx in 0..layer_sizes.len() - 1 {
+                let in_size = layer_sizes[layer_idx];
+                let out_size = layer_sizes[layer_idx + 1];
+                let weight_count = in_size * out_size;
+
+                if inputs.len() < offset + weight_count + out_size {
+                    return Err(NeuralIntegrationError::OperationError(
+                        format!("Insufficient data for layer {} forward propagation", layer_idx),
+                    ));
+                }
+
+                let weights_start = offset;
+                let bias_start = offset + weight_count;
+
+                let mut next = Vec::with_capacity(out_size);
+                for j in 0..out_size {
+                    let mut sum = inputs[bias_start + j]; // bias
+                    for i in 0..in_size {
+                        sum = sum + current[i] * inputs[weights_start + i * out_size + j];
+                    }
+                    next.push(sum);
+                }
+
+                current = next;
+                offset += weight_count + out_size;
+            }
+
+            Ok(current)
+        }
+
+        NeuralOperation::BackwardPropagation { layer_sizes, _phantom } => {
+            // Gradient computation: dL/dx = W^T * dL/dy
+            // Input layout: [input_data, weights, output_gradients]
+            // Uses first and last layer sizes for a single-step gradient computation
+            if layer_sizes.len() < 2 {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Need at least 2 layer sizes for backward propagation".to_string(),
+                ));
+            }
+
+            let input_size = layer_sizes[0];
+            let output_size = *layer_sizes.last().unwrap();
+            let weight_count = input_size * output_size;
+            let grad_start = input_size + weight_count;
+
+            if inputs.len() < grad_start + output_size {
+                return Err(NeuralIntegrationError::OperationError(
+                    "Insufficient data for backward propagation".to_string(),
+                ));
+            }
+
+            // Compute input gradients: dL/dx = W^T * dL/dy
+            let mut result = Vec::with_capacity(input_size);
+            for i in 0..input_size {
+                let mut sum = T::zero();
+                for j in 0..output_size {
+                    sum = sum + inputs[input_size + i * output_size + j] * inputs[grad_start + j];
+                }
+                result.push(sum);
+            }
+            Ok(result)
+        }
+
+        NeuralOperation::Custom { name, .. } => {
+            Err(NeuralIntegrationError::OperationError(
+                format!("CPU fallback not available for custom kernel: {}", name),
+            ))
         }
     }
 }

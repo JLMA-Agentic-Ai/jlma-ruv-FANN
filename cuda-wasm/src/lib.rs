@@ -3,7 +3,7 @@
 //! This crate provides a complete toolchain for translating CUDA code to Rust,
 //! with support for WebGPU backends and WASM compilation.
 
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 // Allow unsafe code for low-level memory operations
 #![allow(unsafe_code)]
 
@@ -17,9 +17,15 @@ pub mod backend;
 pub mod utils;
 pub mod prelude;
 pub mod profiling;
+/// SIMD acceleration layer with runtime feature detection
+pub mod simd;
 
 // Neural integration module for ruv-FANN
 pub mod neural_integration;
+
+// Nutanix platform integration (requires serde feature for full API support)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod nutanix;
 
 // Re-export main types
 pub use error::{CudaRustError, Result};
