@@ -715,7 +715,7 @@ mod tests {
                 assert!(func.is_entry);
                 assert!(!func.body.is_empty());
             }
-            _ => panic!("Expected entry directive"),
+            other => panic!("Expected entry directive, got {:?}", other),
         }
     }
 
@@ -737,7 +737,7 @@ mod tests {
                 assert_eq!(inst.type_suffix, Some(PtxType::F32));
                 assert_eq!(inst.operands.len(), 3);
             }
-            _ => panic!("Expected instruction"),
+            other => panic!("Expected instruction, got {:?}", other),
         }
     }
 
@@ -752,7 +752,7 @@ mod tests {
                 assert!(!pred.negated);
                 assert_eq!(inst.opcode, "bra");
             }
-            _ => panic!("Expected instruction"),
+            other => panic!("Expected instruction, got {:?}", other),
         }
     }
 
@@ -765,7 +765,7 @@ mod tests {
                 assert_eq!(pred.register, "p1");
                 assert!(pred.negated);
             }
-            _ => panic!("Expected instruction"),
+            other => panic!("Expected instruction, got {:?}", other),
         }
     }
 
@@ -774,7 +774,7 @@ mod tests {
         let stmt = parse_statement("LOOP:").unwrap();
         match stmt {
             PtxStatement::Label(name) => assert_eq!(name, "LOOP"),
-            _ => panic!("Expected label"),
+            other => panic!("Expected label, got {:?}", other),
         }
     }
 
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(operands.len(), 2);
         match &operands[0] {
             PtxOperand::SpecialReg(r) => assert_eq!(r, "%tid.x"),
-            _ => panic!("Expected special register"),
+            other => panic!("Expected special register, got {:?}", other),
         }
     }
 
@@ -796,7 +796,7 @@ mod tests {
                 assert_eq!(base, "%r0");
                 assert_eq!(*offset, Some(4));
             }
-            _ => panic!("Expected address"),
+            other => panic!("Expected address, got {:?}", other),
         }
     }
 
@@ -805,7 +805,7 @@ mod tests {
         let operands = parse_operands("42");
         match &operands[0] {
             PtxOperand::ImmInt(v) => assert_eq!(*v, 42),
-            _ => panic!("Expected immediate int"),
+            other => panic!("Expected immediate int, got {:?}", other),
         }
     }
 
@@ -819,7 +819,7 @@ mod tests {
                 assert_eq!(var.var_type, PtxType::F32);
                 assert_eq!(var.space, PtxSpace::Global);
             }
-            _ => panic!("Expected global var"),
+            other => panic!("Expected global var, got {:?}", other),
         }
     }
 
@@ -846,7 +846,7 @@ mod tests {
             crate::parser::ast::Item::Kernel(k) => {
                 assert_eq!(k.name, "simple");
             }
-            _ => panic!("Expected kernel"),
+            other => panic!("Expected kernel, got {:?}", other),
         }
     }
 

@@ -159,13 +159,15 @@ where
             };
             executor.execute(&config, args)?;
         }
-        super::BackendType::Native => {
-            // TODO: Native GPU execution
-            return Err(runtime_error!("Native GPU backend not yet implemented"));
-        }
-        super::BackendType::WebGPU => {
-            // TODO: WebGPU execution
-            return Err(runtime_error!("WebGPU backend not yet implemented"));
+        super::BackendType::Native | super::BackendType::WebGPU => {
+            // For Rust KernelFunction closures, CPU execution is the correct path.
+            // The GPU backends (Native/WebGPU) are used through the BackendTrait
+            // raw kernel API for compiled CUDA/WGSL kernels, not Rust closures.
+            let executor = CpuKernelExecutor {
+                kernel,
+                phantom: PhantomData,
+            };
+            executor.execute(&config, args)?;
         }
     }
     
