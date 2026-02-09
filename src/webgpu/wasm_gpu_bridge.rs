@@ -682,7 +682,7 @@ impl WasmGpuBridge {
 
         // Store context
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             inner.gpu_context = Some(gpu_context);
         }
 
@@ -745,7 +745,7 @@ impl WasmGpuBridge {
         };
 
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             inner
                 .memory_manager
                 .shared_buffers
@@ -766,7 +766,7 @@ impl WasmGpuBridge {
         };
 
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             if let Some(buffer) = inner.memory_manager.shared_buffers.get_mut(name) {
                 match sync_dir {
                     SyncDirection::JsToRust => {
@@ -843,7 +843,7 @@ impl WasmGpuBridge {
         };
 
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             inner.daa_runtime.web_workers.push(web_worker_agent);
         }
 
@@ -862,7 +862,7 @@ impl WasmGpuBridge {
         cols_a: u32,
         cols_b: u32,
     ) -> Result<(), JsValue> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let gpu_context = inner.gpu_context.as_ref().ok_or("WebGPU not initialized")?;
 
         // Create compute shader for matrix multiplication
@@ -945,7 +945,7 @@ impl WasmGpuBridge {
         activation_type: &str,
         steepness: f32,
     ) -> Result<(), JsValue> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let gpu_context = inner.gpu_context.as_ref().ok_or("WebGPU not initialized")?;
 
         // Create activation shader
@@ -967,7 +967,7 @@ impl WasmGpuBridge {
     /// Get performance metrics
     #[wasm_bindgen]
     pub fn get_performance_metrics(&self) -> Result<js_sys::Object, JsValue> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let metrics = js_sys::Object::new();
 
         // GPU metrics
@@ -1086,7 +1086,7 @@ impl WasmGpuBridge {
         closure.forget(); // Keep closure alive
 
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
             inner.daa_runtime.cross_tab_coordinator.broadcast_channel = broadcast_channel;
         }
 
@@ -1118,8 +1118,7 @@ impl WasmGpuBridge {
 
         // Write data to buffer
         let data = js_array.to_vec();
-        let data_u8: &[u8] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        let data_u8: &[u8] = bytemuck::cast_slice(&data);
 
         device
             .queue()

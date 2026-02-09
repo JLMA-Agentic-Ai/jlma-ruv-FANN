@@ -47,6 +47,14 @@ impl TrainingDataStreamReader {
         let num_input: usize = header_parts[1].parse()?;
         let num_output: usize = header_parts[2].parse()?;
 
+        const MAX_NUM_DATA: usize = 100_000_000;
+        if num_data > MAX_NUM_DATA {
+            return Err(IoError::InvalidTrainingData(format!(
+                "num_data ({}) exceeds maximum allowed ({})",
+                num_data, MAX_NUM_DATA
+            )));
+        }
+
         let mut callback = callback;
 
         for i in 0..num_data {
@@ -131,6 +139,14 @@ impl TrainingDataStreamReader {
         let num_data: usize = header_parts[0].parse()?;
         let num_input: usize = header_parts[1].parse()?;
         let num_output: usize = header_parts[2].parse()?;
+
+        const MAX_NUM_DATA: usize = 100_000_000;
+        if num_data > MAX_NUM_DATA {
+            return Err(IoError::InvalidTrainingData(format!(
+                "num_data ({}) exceeds maximum allowed ({})",
+                num_data, MAX_NUM_DATA
+            )));
+        }
 
         let mut input_batch = Vec::with_capacity(batch_size);
         let mut output_batch = Vec::with_capacity(batch_size);

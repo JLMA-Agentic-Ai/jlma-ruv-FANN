@@ -27,6 +27,9 @@ pub use binary::{read_binary, write_binary};
 #[cfg(feature = "compression")]
 pub use compression::{compress_data, decompress_data};
 
+#[cfg(test)]
+mod tests;
+
 /// Supported file formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileFormat {

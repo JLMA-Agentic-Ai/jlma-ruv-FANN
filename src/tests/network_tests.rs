@@ -194,7 +194,7 @@ fn test_network_run_forward_pass() {
     output_layer.neurons[0].add_connection(5, 0.0); // From bias
 
     let input = vec![1.0, 1.0];
-    let output = network.run(&input);
+    let output = network.run(&input).unwrap();
 
     assert_eq!(output.len(), 1);
     // The actual value depends on activation function implementation

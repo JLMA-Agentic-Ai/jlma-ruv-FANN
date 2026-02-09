@@ -78,7 +78,7 @@ impl<T: Float + Send + Sync + Default + std::fmt::Debug + 'static> GpuOptimizedA
         });
         
         // Create pipelines for forward pass, gradient computation, and Adam updates
-        let forward_pipeline = Self::create_forward_pipeline(&device, &shader_module);
+        let forward_pipeline = Self::create_forward_pipeline(&device, &shader_module)?;
         let gradient_pipeline = Self::create_gradient_pipeline(&device, &shader_module);
         let adam_pipeline = Self::create_adam_pipeline(&device, &adam_shader);
         
@@ -268,10 +268,12 @@ impl<T: Float + Send + Sync + Default + std::fmt::Debug + 'static> GpuOptimizedA
     
     // Helper methods...
     
-    fn create_forward_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule) -> wgpu::ComputePipeline {
+    fn create_forward_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule) -> Result<wgpu::ComputePipeline, ComputeError> {
         // Create pipeline for forward pass computation
         // This would use the batch_matrix_vector_multiply shader
-        todo!("Implement forward pipeline creation")
+        Err(ComputeError::UnsupportedOperation(
+            "Forward pipeline creation not yet implemented".to_string(),
+        ))
     }
     
     fn create_gradient_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule) -> wgpu::ComputePipeline {

@@ -58,11 +58,11 @@ pub enum ActivationFunction {
     LinearPieceSymmetric,
 
     /// Rectified Linear Unit (ReLU): f(x) = max(0, x)
-    /// Output range: [0, ∞)
+    /// Output range: [0, inf)
     ReLU,
 
     /// Leaky ReLU: f(x) = x if x > 0, 0.01 * x if x <= 0
-    /// Output range: (-∞, ∞)
+    /// Output range: (-inf, inf)
     ReLULeaky,
 
     /// Sine activation: f(x) = sin(x * steepness) / 2 + 0.5
@@ -80,6 +80,19 @@ pub enum ActivationFunction {
     /// Symmetric cosine: f(x) = cos(x * steepness)
     /// Output range: [-1, 1]
     CosSymmetric,
+
+    /// GELU activation: f(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    /// Output range: (-inf, inf)
+    Gelu,
+
+    /// Swish activation: f(x) = x / (1 + exp(-x))
+    /// Output range: (-inf, inf)
+    Swish,
+
+    /// Leaky ReLU (canonical alias used by SIMD paths, alpha = 0.01)
+    /// f(x) = x if x > 0, 0.01 * x if x <= 0
+    /// Output range: (-inf, inf)
+    LeakyRelu,
 }
 
 impl ActivationFunction {
@@ -104,6 +117,9 @@ impl ActivationFunction {
             ActivationFunction::Cos => "Cos",
             ActivationFunction::SinSymmetric => "SinSymmetric",
             ActivationFunction::CosSymmetric => "CosSymmetric",
+            ActivationFunction::Gelu => "Gelu",
+            ActivationFunction::Swish => "Swish",
+            ActivationFunction::LeakyRelu => "LeakyRelu",
         }
     }
 
@@ -134,6 +150,9 @@ impl ActivationFunction {
             ActivationFunction::ReLULeaky => ("-inf", "inf"),
             ActivationFunction::Sin | ActivationFunction::Cos => ("0", "1"),
             ActivationFunction::SinSymmetric | ActivationFunction::CosSymmetric => ("-1", "1"),
+            ActivationFunction::Gelu
+            | ActivationFunction::Swish
+            | ActivationFunction::LeakyRelu => ("-inf", "inf"),
         }
     }
 }

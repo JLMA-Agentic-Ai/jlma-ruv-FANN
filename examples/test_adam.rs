@@ -89,7 +89,7 @@ fn main() {
 
 fn test_network(network: &mut Network<f32>, data: &TrainingData<f32>) {
     for (i, (input, expected)) in data.inputs.iter().zip(data.outputs.iter()).enumerate() {
-        let output = network.run(input);
+        let output = network.run(input).unwrap();
         println!(
             "  Input: {:?} -> Output: {:.3}, Expected: {:.3}",
             input, output[0], expected[0]

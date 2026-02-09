@@ -59,6 +59,13 @@ impl FannReader {
                         num_layers = value.parse().map_err(|e| {
                             IoError::ParseError(format!("Invalid num_layers: {e:?}"))
                         })?;
+                        const MAX_NUM_LAYERS: usize = 10_000;
+                        if num_layers > MAX_NUM_LAYERS {
+                            return Err(IoError::InvalidNetwork(format!(
+                                "num_layers ({}) exceeds maximum allowed ({})",
+                                num_layers, MAX_NUM_LAYERS
+                            )));
+                        }
                     }
                     "connection_rate" => {
                         connection_rate = value.parse().map_err(|e| {

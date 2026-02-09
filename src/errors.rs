@@ -458,6 +458,16 @@ impl From<NetworkError> for RuvFannError {
                 message: "Network has no layers".to_string(),
                 context: None,
             },
+            NetworkError::NotImplemented(msg) => RuvFannError::Network {
+                category: NetworkErrorCategory::Topology,
+                message: format!("Not implemented: {msg}"),
+                context: None,
+            },
+            NetworkError::DataSizeMismatch { expected, actual } => RuvFannError::Network {
+                category: NetworkErrorCategory::Topology,
+                message: format!("Data size mismatch: expected {expected}, got {actual}"),
+                context: None,
+            },
         }
     }
 }

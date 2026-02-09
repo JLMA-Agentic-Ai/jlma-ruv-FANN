@@ -251,6 +251,82 @@ impl<T: Float> StopCriteria<T> for BitFailStopCriteria<T> {
 /// Callback function type for training progress
 pub type TrainingCallback<T> = Box<dyn FnMut(usize, T) -> bool + Send>;
 
+/// Shared base for all training algorithms.
+///
+/// Holds the error function and optional callback that every trainer needs,
+/// along with the implementations of `calculate_error`, `count_bit_fails`,
+/// `set_callback`, and `call_callback` that were previously duplicated across
+/// every algorithm file.
+pub struct TrainerBase<T: Float> {
+    pub error_function: Box<dyn ErrorFunction<T>>,
+    pub callback: Option<TrainingCallback<T>>,
+}
+
+impl<T: Float + Default + Send> TrainerBase<T> {
+    /// Create a new `TrainerBase` with the given error function and no callback.
+    pub fn new(error_function: Box<dyn ErrorFunction<T>>) -> Self {
+        Self {
+            error_function,
+            callback: None,
+        }
+    }
+
+    /// Calculate the current error across all training samples.
+    pub fn calculate_error(&self, network: &Network<T>, data: &TrainingData<T>) -> T {
+        let mut total_error = T::zero();
+        let mut network_clone = network.clone();
+
+        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
+            let output = network_clone.run_unchecked(input);
+            total_error = total_error + self.error_function.calculate(&output, desired_output);
+        }
+
+        total_error / T::from(data.inputs.len()).unwrap_or(T::one())
+    }
+
+    /// Count the number of output bits that deviate from desired by more than `bit_fail_limit`.
+    pub fn count_bit_fails(
+        &self,
+        network: &Network<T>,
+        data: &TrainingData<T>,
+        bit_fail_limit: T,
+    ) -> usize {
+        let mut bit_fails = 0;
+        let mut network_clone = network.clone();
+
+        for (input, desired_output) in data.inputs.iter().zip(data.outputs.iter()) {
+            let output = network_clone.run_unchecked(input);
+            for (&actual, &desired) in output.iter().zip(desired_output.iter()) {
+                if (actual - desired).abs() > bit_fail_limit {
+                    bit_fails += 1;
+                }
+            }
+        }
+
+        bit_fails
+    }
+
+    /// Set a callback function for training progress monitoring.
+    pub fn set_callback(&mut self, callback: TrainingCallback<T>) {
+        self.callback = Some(callback);
+    }
+
+    /// Call the callback if set, returning `true` to continue or `false` to stop.
+    pub fn call_callback(
+        &mut self,
+        epoch: usize,
+        network: &Network<T>,
+        data: &TrainingData<T>,
+    ) -> bool {
+        let error = self.calculate_error(network, data);
+        if let Some(ref mut callback) = self.callback {
+            callback(epoch, error)
+        } else {
+            true
+        }
+    }
+}
+
 /// Main trait for training algorithms
 pub trait TrainingAlgorithm<T: Float>: Send {
     /// Train for one epoch

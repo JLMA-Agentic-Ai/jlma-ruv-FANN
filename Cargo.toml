@@ -1,6 +1,6 @@
 [package]
 name = "ruv-fann"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["rUv Contributors"]
@@ -143,6 +143,10 @@ test-all = ["gpu", "ruv-swarm", "ruv-swarm-daa", "benchmarking"]
 test-core = ["std", "parallel"]
 test-gpu = ["gpu", "webgpu"]
 test-no-external = []  # For tests that don't require external crates
+
+[[bench]]
+name = "neural_network"
+harness = false
 
 [[example]]
 name = "basic_usage"

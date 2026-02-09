@@ -4,16 +4,52 @@ use crate::io::error::{IoError, IoResult};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-/// Read binary data from a reader
+/// Default maximum size for binary deserialization (256 MB)
+const DEFAULT_BINARY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read binary data from a reader with a default size limit of 256 MB.
+///
+/// To specify a custom limit, use [`read_binary_with_limit`].
 pub fn read_binary<T, R>(reader: &mut R) -> IoResult<T>
 where
     T: for<'de> Deserialize<'de>,
     R: Read,
 {
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
+    read_binary_with_limit(reader, DEFAULT_BINARY_MAX_BYTES)
+}
 
-    let value = bincode::deserialize(&buffer)?;
+/// Read binary data from a reader with an explicit size limit.
+///
+/// Returns an error if the input exceeds `max_bytes` or if deserialization
+/// of the inner structure exceeds `max_bytes` (via `bincode::Options::with_limit`).
+pub fn read_binary_with_limit<T, R>(reader: &mut R, max_bytes: u64) -> IoResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+    R: Read,
+{
+    use bincode::Options;
+
+    let mut buffer = Vec::new();
+    let mut limited_reader = reader.take(max_bytes.saturating_add(1));
+    limited_reader.read_to_end(&mut buffer)?;
+
+    if buffer.len() as u64 > max_bytes {
+        return Err(IoError::SerializationError(format!(
+            "Binary data exceeds size limit of {} bytes",
+            max_bytes
+        )));
+    }
+
+    // Use options compatible with bincode::serialize() defaults
+    // (little endian, fixed-length int encoding, allow trailing bytes)
+    let options = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .allow_trailing_bytes()
+        .with_limit(max_bytes);
+    let value = options.deserialize(&buffer).map_err(|e| {
+        IoError::SerializationError(format!("Bincode deserialization error: {e}"))
+    })?;
     Ok(value)
 }
 
@@ -87,7 +123,7 @@ impl BinaryReader {
         Self { config }
     }
 
-    /// Read data from a reader
+    /// Read data from a reader (default 256 MB limit)
     pub fn read<T, R>(&self, reader: &mut R) -> IoResult<T>
     where
         T: for<'de> Deserialize<'de>,
@@ -102,18 +138,7 @@ impl BinaryReader {
         T: for<'de> Deserialize<'de>,
         R: Read,
     {
-        let mut buffer = Vec::new();
-        let mut limited_reader = reader.take(limit);
-        limited_reader.read_to_end(&mut buffer)?;
-
-        if buffer.len() as u64 == limit {
-            return Err(IoError::SerializationError(
-                "Data exceeds size limit".to_string(),
-            ));
-        }
-
-        let value = bincode::deserialize(&buffer)?;
-        Ok(value)
+        read_binary_with_limit(reader, limit)
     }
 }
 

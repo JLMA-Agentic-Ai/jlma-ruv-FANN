@@ -156,7 +156,7 @@ fn demo_ruv_fann_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Run inference using ruv-FANN (CPU)
     println!("\nRunning inference:");
     let start = std::time::Instant::now();
-    let cpu_output = network.run(&input_data);
+    let cpu_output = network.run(&input_data)?;
     let cpu_time = start.elapsed();
     
     println!("  CPU (ruv-FANN): {:?} in {:.3}ms", cpu_output, cpu_time.as_millis());
@@ -193,7 +193,7 @@ fn demo_ruv_fann_integration() -> Result<(), Box<dyn std::error::Error>> {
     // CPU batch processing
     let start = std::time::Instant::now();
     let _cpu_batch_results: Vec<Vec<f32>> = batch_inputs.iter()
-        .map(|input| network.run(input))
+        .map(|input| network.run(input).unwrap())
         .collect();
     let cpu_batch_time = start.elapsed();
     
